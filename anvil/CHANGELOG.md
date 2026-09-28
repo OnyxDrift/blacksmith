@@ -41,6 +41,17 @@ Baseline note schema: `type`, `domain`, `subdomain`, `project`, `source`,
 
 ## Tooling (the anvil scripts and Skills themselves; `version` in `.claude-plugin/plugin.json` since 0.0.0_8, `TOOLING_VERSION` before)
 
+### 0.0.5
+
+The installer cleans up after the early anvil (before blacksmith). Its six
+user skills in `~/.claude/skills` (`recall`, `note`, `reflect`, `anvil`,
+`hydrate`, `fill-vault`) showed as `/recall`, `/note`, ... next to the
+plugin's `/anvil:…` skills. Each one that names the early tooling path
+(`~/.anvil/bin/<command>`) moves to `~/.blacksmith/legacy/`; a skill with
+the same name from anywhere else stays. An early vault at `~/.anvil` is
+reported with its note count and the two ways to keep its notes; nothing
+moves on its own.
+
 ### 0.0.4
 
 Claude Code runs a plugin from its own cache copy

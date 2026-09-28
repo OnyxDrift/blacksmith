@@ -325,11 +325,31 @@ fi
 echo
 echo "==> Vault ready: $ANVIL_HOME"
 
+# The early anvil (before blacksmith) kept its vault and tooling in ~/.anvil.
+# Report it; moving notes is the user's call.
+LEGACY="$HOME/.anvil"
+if [ -d "$LEGACY" ] && [ "$(cd "$LEGACY" && pwd -P)" != "$(cd "$ANVIL_HOME" && pwd -P)" ]; then
+  LEGACY_NOTES="$(find "$LEGACY/semantic" "$LEGACY/procedural" "$LEGACY/strategic" "$LEGACY/episodic" -name '*.md' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  cat <<EOF
+
+==> NOTE: an early anvil install is still at $LEGACY ($LEGACY_NOTES notes).
+    This install does not use it. To keep those notes, either:
+      - re-run this installer, choose "existing vault", and give $LEGACY
+        as the path (then run: anvil migrate), or
+      - copy its semantic/, procedural/, strategic/, and episodic/ notes
+        into $ANVIL_HOME, then run: anvil migrate
+    Its bin/ and CLAUDE_BLOCK.md are no longer used. A project where you ran
+    the early 'anvil init' has a "## Anvil" section in its CLAUDE.md that
+    points at $LEGACY/bin; remove that section.
+EOF
+fi
+
 echo
 echo "==> anvil plugin"
 if [ "$SKIP_SETTINGS" = false ]; then
   bs_settings_add
   bs_import_add
+  bs_legacy_anvil_skills
 fi
 bs_register
 if [ "$SKIP_HOSTS" = false ]; then

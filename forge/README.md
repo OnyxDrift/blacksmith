@@ -8,7 +8,7 @@ Forge is a Claude Code plugin that carries working conventions into every
 repo: how to record hard-won lessons, track work, summarise large files, and
 set up credentials. It is part of [blacksmith](../README.md).
 
-> **Version 0.0.3**, with anvil 0.0.4; 0.0.2 was the first public release. Every
+> **Version 0.0.3**, with anvil 0.0.5; 0.0.2 was the first public release. Every
 > command was first checked by hand on 2026-09-24; `card` and `todo` also
 > fired on their own in headless sessions. [CHANGELOG.md](CHANGELOG.md) has the history.
 

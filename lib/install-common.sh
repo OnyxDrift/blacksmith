@@ -246,6 +246,31 @@ bs_import_remove() {
   echo "  removed the $PLUGIN pointer import from $file"
 }
 
+# The early anvil (before blacksmith) installed six user skills into
+# ~/.claude/skills. User skills get no plugin prefix, so they show as
+# /recall, /note, ... next to /anvil:recall, /anvil:note. Move each one
+# that is from the early anvil (its SKILL.md names the early tooling path,
+# such as ~/.anvil/bin/recall or ~/.anvil/bin/audit) into a backup folder. A skill with the same
+# name from anywhere else stays.
+bs_legacy_anvil_skills() {
+  local dir="$CLAUDE_DIR/skills" backup="" name f
+  for name in recall note reflect anvil hydrate fill-vault; do
+    f="$dir/$name/SKILL.md"
+    [ -f "$f" ] || continue
+    grep -qE '/bin/(anvil|audit|note|recall|session-read|sessions|status|upgrade|upgrade-vault|usage)' "$f" || continue
+    grep -q 'anvil' "$f" || continue
+    if [ -z "$backup" ]; then
+      backup="$BLACKSMITH_HOME/legacy/claude-skills-$(date -u +%Y%m%dT%H%M%SZ)"
+      mkdir -p "$backup"
+    fi
+    mv "$dir/$name" "$backup/$name"
+    echo "  moved the early anvil skill /$name out of $dir"
+  done
+  if [ -n "$backup" ]; then
+    echo "    (backup: $backup; the plugin's /anvil:… skills replace them)"
+  fi
+}
+
 # Host setup, once per machine, when hosts.tsv is missing.
 bs_hosts() {
   if [ ! -f "$BLACKSMITH_HOME/config/hosts.tsv" ]; then
