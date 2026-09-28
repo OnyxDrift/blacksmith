@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""anvil world — where your work stands and where your thinking is going.
+
+  anvil world                     latest handoff per project of the last 30
+                                  days, then the last 10 journal entries
+  anvil world [--full] [<project>]
+                                  that project's latest handoff in full, and
+                                  its earlier handoffs of the last 90 days;
+                                  with no project, the most recent one
+  anvil world journal [<word>] [--page N]
+                                  every journal entry, 20 per page, newest
+                                  first; with a word, only matching entries
+
+A handoff is an episodic note tagged `handoff` (/anvil:handoff): where a
+project stands. A journal entry is an episodic note tagged `journal`
+(/anvil:journal): where a thinking session went, before any project
+exists. --days N overrides the 30- or 90-day window. Nothing here is
+maintained by hand.
+"""
+import datetime
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import anvil_common as ac  # noqa: E402
+
+BUDGET_CHARS = 2400
+DEFAULT_DAYS = 30
+PROJECT_DAYS = 90
+JOURNAL_RECENT = 10
+JOURNAL_PAGE = 20
+
+
+def episodic(tag):
+    """Canonical episodic notes with this tag, newest first."""
+    folder = os.path.join(ac.vault(), "episodic")
+    out = []
+    if not os.path.isdir(folder):
+        return out
+    for n in os.listdir(folder):
+        if not n.endswith(".md"):
+            continue
+        path = os.path.join(folder, n)
+        f, _, body = ac.read_note(path)
+        if tag not in ac.parse_tags(f.get("tags", "")) or f.get("status") != "canonical":
+            continue
+        out.append((f.get("updated") or n[:10], os.path.getmtime(path), f, body, path))
+    # Newest first: by date, then by when the file was last written.
+    out.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return out
+
+
+def section(body, name):
+    """First non-empty line of a '## <name>' section."""
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "## " + name.lower():
+            for nxt in lines[i + 1:]:
+                if nxt.startswith("## "):
+                    return ""
+                if nxt.strip():
+                    return nxt.strip().lstrip("-* ").strip()
+    return ""
+
+
+def count_items(body, name):
+    lines, n, inside = body.splitlines(), 0, False
+    for line in lines:
+        if line.startswith("## "):
+            inside = line.strip().lower() == "## " + name.lower()
+            continue
+        if inside and line.strip().startswith(("-", "*")):
+            n += 1
+    return n
+
+
+def project_of(f):
+    return f.get("project") or "(no project)"
+
+
+def one_line(f, body):
+    title = next((l[2:].strip() for l in body.splitlines() if l.startswith("# ")), "")
+    return f.get("description") or title
+
+
+def cutoff(days):
+    return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+
+
+def name_of(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def full(project, days):
+    trail = [h for h in episodic("handoff") if project_of(h[2]).lower() == project.lower()]
+    if not trail:
+        print("No handoff for project %r. Projects with handoffs: %s" % (
+            project, ", ".join(sorted({project_of(h[2]) for h in episodic("handoff")})) or "none"))
+        return 1
+    _, _, f, body, path = trail[0]
+    print(body.strip())
+    earlier = [h for h in trail[1:] if h[0] >= cutoff(days)]
+    if earlier:
+        print("\nEarlier handoffs, last %d days:" % days)
+        for updated, _, ef, ebody, epath in earlier:
+            print("  %s  %s" % (updated, one_line(ef, ebody)))
+            print("      anvil show %s" % name_of(epath))
+    return 0
+
+
+def journal_list(words, page):
+    """Every journal entry, newest first, JOURNAL_PAGE per page; with words,
+    only entries whose topic, tags, title, description, or body contain them."""
+    entries = episodic("journal")
+    query = " ".join(words).lower()
+    if query:
+        entries = [e for e in entries
+                   if query in " ".join([e[2].get("project", ""), e[2].get("tags", ""),
+                                         e[2].get("description", ""), e[3]]).lower()]
+    if not entries:
+        print("No journal entries%s. Write one with /anvil:journal after a thinking session." % (
+            " match %r" % query if query else ""))
+        return 0
+    pages = (len(entries) + JOURNAL_PAGE - 1) // JOURNAL_PAGE
+    page = max(1, min(page, pages))
+    shown = entries[(page - 1) * JOURNAL_PAGE:page * JOURNAL_PAGE]
+    print("Journal%s, page %d of %d (%d entries, newest first):\n" % (
+        " matching %r" % query if query else "", page, pages, len(entries)))
+    for updated, _, jf, jbody, jpath in shown:
+        topic = jf.get("project") or ""
+        print("  %s  %s%s" % (updated, one_line(jf, jbody), "  [%s]" % topic if topic else ""))
+        print("      anvil show %s" % name_of(jpath))
+    if page < pages:
+        print("\nNext page: /anvil:world journal%s page %d" % (" " + query if query else "", page + 1))
+    return 0
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    days = None
+    if "--days" in argv:
+        i = argv.index("--days")
+        days = int(argv[i + 1])
+        argv = argv[:i] + argv[i + 2:]
+    if argv and argv[0] == "journal":
+        rest, page = argv[1:], 1
+        if "--page" in rest:
+            i = rest.index("--page")
+            page = int(rest[i + 1])
+            rest = rest[:i] + rest[i + 2:]
+        return journal_list(rest, page)
+    if argv and not argv[0].startswith("--"):
+        # `anvil world <project>` is the same as `anvil world --full <project>`.
+        argv = ["--full"] + argv
+    if "--full" in argv:
+        i = argv.index("--full") + 1
+        if i < len(argv) and not argv[i].startswith("--"):
+            return full(argv[i], days or PROJECT_DAYS)
+        # No project named: the most recently active one.
+        latest = episodic("handoff")
+        if not latest:
+            print("No handoffs yet. Write one with /anvil:handoff at the end of a session.")
+            return 0
+        return full(project_of(latest[0][2]), days or PROJECT_DAYS)
+    days = days or DEFAULT_DAYS
+    since = cutoff(days)
+
+    latest = {}
+    for h in episodic("handoff"):
+        if h[0] >= since:
+            latest.setdefault(project_of(h[2]), h)
+    journal = episodic("journal")[:JOURNAL_RECENT]
+
+    if not latest and not journal:
+        print("Nothing yet. Record a session with /anvil:handoff, or a thinking session with /anvil:journal.")
+        return 0
+
+    blocks = []
+    for proj, (updated, _, f, body, _) in sorted(latest.items(), key=lambda kv: kv[1][0], reverse=True):
+        lines = ["%s — %s" % (proj, updated), "  %s" % one_line(f, body)]
+        nxt = section(body, "Next")
+        if nxt:
+            lines.append("  next: %s" % nxt)
+        extra = []
+        left, questions = count_items(body, "Left"), count_items(body, "Open questions")
+        if left:
+            extra.append("%d left" % left)
+        if questions:
+            extra.append("%d open question%s" % (questions, "" if questions == 1 else "s"))
+        if extra:
+            lines.append("  " + ", ".join(extra))
+        blocks.append("\n".join(lines))
+
+    out, used, dropped = [], 0, 0
+    for b in blocks:
+        if used + len(b) > BUDGET_CHARS and out:
+            dropped += 1
+            continue
+        out.append(b)
+        used += len(b) + 1
+
+    if out:
+        print("Handoffs, last %d days (latest per project):\n" % days)
+        print("\n\n".join(out))
+        if dropped:
+            print("\n(%d older project%s left out to stay within budget)" % (
+                dropped, "" if dropped == 1 else "s"))
+        print("\nFull handoff and earlier ones (%d days): /anvil:world <project>" % PROJECT_DAYS)
+    if journal:
+        print("\n" if out else "", end="")
+        print("Journal, last %d entries:" % len(journal))
+        for updated, _, jf, jbody, jpath in journal:
+            topic = jf.get("project") or ""
+            print("  %s  %s%s" % (updated, one_line(jf, jbody), "  [%s]" % topic if topic else ""))
+        print("\nAll entries or a search: /anvil:world journal [word]")
+    return 0
+
+
+if __name__ == "__main__":
+    if not os.path.isdir(ac.vault()):
+        ac.die("anvil vault not found at %s" % ac.vault())
+    sys.exit(main(sys.argv[1:]))

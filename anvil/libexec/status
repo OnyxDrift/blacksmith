@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Usage: status
+# Prints a domain/subdomain tree and basic metrics for the anvil vault.
+# Read-only — never writes anything. Uses only grep/awk/find/du, no new
+# dependencies beyond what recall/note already need.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+NOTE_DIRS="$ANVIL_ROOT/semantic $ANVIL_ROOT/procedural $ANVIL_ROOT/strategic $ANVIL_ROOT/episodic"
+ALL_NOTES=$(find $NOTE_DIRS -maxdepth 1 -name '*.md' 2>/dev/null || true)
+
+echo "=== anvil status: $ANVIL_ROOT ==="
+echo
+
+# --- versions: two independent axes. Schema = note frontmatter shape:
+# the package ships SCHEMA_VERSION, the vault records what its data is
+# migrated to in .anvil-applied-version, `anvil migrate` closes the gap.
+# Tooling = the anvil package itself (plugin.json version), updated with
+# `git pull` + `ai/blacksmith/install.sh --update`. ---
+INSTALLED_SCHEMA=$(tr -d '[:space:]' < "$ANVIL_PKG/SCHEMA_VERSION" 2>/dev/null || true)
+if [ -n "$INSTALLED_SCHEMA" ]; then
+  if [ -f "$ANVIL_ROOT/.anvil-applied-version" ]; then
+    APPLIED_SCHEMA=$(tr -d '[:space:]' < "$ANVIL_ROOT/.anvil-applied-version")
+  else
+    APPLIED_SCHEMA="<none>"
+  fi
+  if [ "$INSTALLED_SCHEMA" = "$APPLIED_SCHEMA" ]; then
+    echo "Schema version: $INSTALLED_SCHEMA"
+  else
+    echo "Schema version: package $INSTALLED_SCHEMA, vault data at $APPLIED_SCHEMA"
+    echo "WARNING: vault note data is behind the package schema — run: anvil migrate"
+  fi
+fi
+echo "Tooling version: $(anvil_tooling_version)"
+echo "Package: $ANVIL_PKG"
+echo
+
+echo "Notes by type:"
+for t in semantic procedural strategic episodic; do
+  count=$(find "$ANVIL_ROOT/$t" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+  printf "  %-12s %s\n" "$t" "$count"
+done
+echo
+
+echo "Notes by status:"
+for s in canonical draft disputed archived; do
+  count=0
+  for f in $ALL_NOTES; do
+    if grep -q "^status: $s$" "$f" 2>/dev/null; then
+      count=$((count + 1))
+    fi
+  done
+  printf "  %-12s %s\n" "$s" "$count"
+done
+echo
+
+# --- domain / subdomain tree, rooted at domains.txt so unused domains still show ---
+PAIRS_FILE=$(mktemp)
+trap 'rm -f "$PAIRS_FILE"' EXIT
+
+for f in $ALL_NOTES; do
+  if grep -q "^status: canonical$" "$f" 2>/dev/null; then
+    d=$(grep "^domain:" "$f" | head -1 | sed 's/^domain:[[:space:]]*//')
+    sd=$(grep "^subdomain:" "$f" | head -1 | sed 's/^subdomain:[[:space:]]*//')
+    [ -z "$sd" ] && sd="(none)"
+    printf '%s\t%s\n' "$d" "$sd" >> "$PAIRS_FILE"
+  fi
+done
+
+echo "Domain / subdomain tree (canonical notes only):"
+if [ -f "$ANVIL_ROOT/domains.txt" ]; then
+  DOMAIN_LIST=$(grep -v '^[[:space:]]*#' "$ANVIL_ROOT/domains.txt" | grep -v '^[[:space:]]*$')
+else
+  DOMAIN_LIST=$(cut -f1 "$PAIRS_FILE" 2>/dev/null | sort -u)
+fi
+
+echo "$DOMAIN_LIST" | while read -r d; do
+  [ -z "$d" ] && continue
+  total=$(awk -F'\t' -v d="$d" '$1==d' "$PAIRS_FILE" 2>/dev/null | wc -l | tr -d ' ')
+  printf "  %s (%s)\n" "$d" "$total"
+  if [ "$total" != "0" ]; then
+    awk -F'\t' -v d="$d" '$1==d {print $2}' "$PAIRS_FILE" | sort | uniq -c | sort -rn | \
+      while read -r cnt sd; do
+        printf "    %-24s %s\n" "$sd" "$cnt"
+      done
+  fi
+done
+echo
+
+# --- drift: domains used in notes but not in domains.txt ---
+if [ -f "$ANVIL_ROOT/domains.txt" ] && [ -s "$PAIRS_FILE" ]; then
+  UNKNOWN=""
+  for d in $(cut -f1 "$PAIRS_FILE" | sort -u); do
+    if ! echo "$DOMAIN_LIST" | grep -qix "$d"; then
+      UNKNOWN="$UNKNOWN$d
+"
+    fi
+  done
+  if [ -n "$UNKNOWN" ]; then
+    echo "WARNING: domains used in notes but not in domains.txt (drift):"
+    echo "$UNKNOWN" | sed '/^$/d;s/^/  - /'
+    echo
+  fi
+fi
+
+# --- orphans: canonical notes not linked from any moc/*.md ---
+# Episodic notes (handoffs, journal entries, dated events) stay out of the
+# MOC files by design, so they are never orphans.
+if [ -d "$ANVIL_ROOT/moc" ]; then
+  ORPHANS=""
+  for f in $ALL_NOTES; do
+    case "$f" in */episodic/*) continue ;; esac
+    if grep -q "^status: canonical$" "$f" 2>/dev/null; then
+      base="$(basename "$f" .md)"
+      if ! grep -rqF "[[$base]]" "$ANVIL_ROOT/moc" 2>/dev/null; then
+        ORPHANS="$ORPHANS$base
+"
+      fi
+    fi
+  done
+  if [ -n "$ORPHANS" ]; then
+    echo "WARNING: canonical notes not linked from any moc/*.md (orphans):"
+    echo "$ORPHANS" | sed '/^$/d;s/^/  - /'
+    echo
+  fi
+fi
+
+# --- drafts waiting for review ---
+DRAFTS=$(find "$ANVIL_ROOT/_inbox" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$DRAFTS" != "0" ]; then
+  echo "Drafts waiting in _inbox/: $DRAFTS — review them with /anvil:inbox"
+  echo
+fi
+
+# --- missing description: recall shows it in place of the whole note ---
+MISSING_DESC=$("$ANVIL_PKG/libexec/audit" --field description 2>/dev/null | wc -l | tr -d ' ')
+if [ "$MISSING_DESC" != "0" ]; then
+  echo "WARNING: $MISSING_DESC canonical note(s) have no description; recall shows"
+  echo "  their title only. /anvil:backfill proposes descriptions, with approval."
+  echo
+fi
+
+# --- origins outside the current rules (local paths, ssh remotes) ---
+BAD_ORIGINS=$("$ANVIL_PKG/libexec/audit" --bad-origin 2>/dev/null | wc -l | tr -d ' ')
+if [ "$BAD_ORIGINS" != "0" ]; then
+  echo "WARNING: $BAD_ORIGINS canonical note(s) have an origin outside the rules (a local"
+  echo "  path or ssh remote). List: anvil audit --bad-origin. Fix: /anvil:backfill origin"
+  echo
+fi
+
+# --- missing origin: canonical notes with no origin, or an empty one ---
+# Shares its check with `anvil audit --field origin`, so this warning and
+# /anvil:backfill's proposal list can never disagree.
+if [ -x "$ANVIL_PKG/libexec/audit" ]; then
+  MISSING_ORIGIN=$("$ANVIL_PKG/libexec/audit" --field origin 2>/dev/null || true)
+  if [ -n "$MISSING_ORIGIN" ]; then
+    echo "WARNING: canonical notes missing an origin (what backs the claim):"
+    echo "$MISSING_ORIGIN" | sed '/^$/d;s|^.*/||;s|\.md$||;s|^|  - |'
+    echo "  Run /anvil:backfill origin: it proposes a real value, or 'none' when"
+    echo "  nothing backs the note (a decision, which silences this warning)."
+    echo
+  fi
+fi
+
+echo "Vault size on disk:"
+du -sh "$ANVIL_ROOT" 2>/dev/null | awk '{print "  " $1}'
+echo
+
+echo "Canonical note content (rough size estimate):"
+TOTAL_WORDS=0
+TOTAL_CHARS=0
+for f in $ALL_NOTES; do
+  if grep -q "^status: canonical$" "$f" 2>/dev/null; then
+    w=$(wc -w < "$f" | tr -d ' ')
+    c=$(wc -c < "$f" | tr -d ' ')
+    TOTAL_WORDS=$((TOTAL_WORDS + w))
+    TOTAL_CHARS=$((TOTAL_CHARS + c))
+  fi
+done
+EST_TOKENS=$((TOTAL_CHARS / 4))
+echo "  ~$TOTAL_WORDS words, ~$TOTAL_CHARS characters, ~$EST_TOKENS tokens"
+echo "  (rough estimate only: ~4 characters per token, no real tokenizer used)"
+echo "  This is the size of the WHOLE canonical vault, not what one /anvil:recall"
+echo "  call costs — recall returns at most 4 matching notes per query, not"
+echo "  this total. Compare that per-query cost against re-deriving the same"
+echo "  answer from scratch to judge whether anvil is actually saving tokens"
+echo "  for a given kind of question."

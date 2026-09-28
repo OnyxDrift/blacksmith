@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""anvil note — the only way a note enters or changes in the vault.
+
+New note:
+  anvil note --type T --domain D --title "..." --description "..." \\
+             [--subdomain x] [--project x] [--tags a,b] [--source claude|human] \\
+             [--origin X] [--supersedes <note-name>] \\
+             (--body-file F | --body -) [--approved]
+
+  Without --approved the note is a DRAFT in _inbox/ (status: draft); recall
+  never sees it. --approved means the user approved this exact note: it goes
+  to <type>/ as canonical and is linked from its domain's moc/ file.
+
+Existing notes (all need --approved, i.e. an approval the user just gave):
+  anvil note --approve <draft>             promote an _inbox/ draft
+  anvil note --unapprove <note>            take back an Approve: the live note goes
+                                           back to _inbox/ as a draft, unlinked
+  anvil note --reject <draft>              move an _inbox/ draft to _archive/rejected/
+  anvil note --restore <draft>             move a rejected draft back to the inbox
+  anvil note --amend <note> (--body-file F | --body -) [--description ".."] --approved
+  anvil note --set <note> <field> <value> --approved
+                                           field: origin description subdomain
+                                           project tags supersedes status
+  anvil note --batch <field> --card [--of "1 of 6"] < proposals.tsv
+                                           backfill card for '<note><TAB><value>' lines
+                                           (field: description origin project); checks each value
+  anvil note --batch <field> --approved < proposals.tsv
+                                           write the whole batch; prints its undo command
+  anvil note --undo-batch <id> --approved  put back the values a batch replaced
+  anvil note --drafts                      list _inbox/ drafts
+  anvil note --list-drafts                 draft paths only, one per line
+  anvil note --review <draft> [--of "1 of 3"] [--part before]
+                                           print a draft as the review card; --part
+                                           before prints the note it replaces
+                                           (exit 3 when its origin link fails)
+  anvil note --check-origin <value>        exit 0 if the origin is allowed
+
+Rules enforced here, not only in the skills:
+  - domain must be in domains.txt; description required (one line, <=200 chars)
+  - body required; type/source/status from fixed lists
+  - origin: empty, a link on a configured Forgejo/Gitea host, a URL in
+    sources.tsv (from /anvil:ingest), or a raw/ path. Without --origin, the
+    current repo's remote is mapped to its web URL (or left empty).
+  - --supersedes archives the named older note when the new one is approved
+"""
+import datetime
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import anvil_common as ac  # noqa: E402
+
+VAULT = ac.vault()
+TODAY = datetime.date.today().isoformat()
+SETTABLE = ("origin", "description", "subdomain", "project", "tags", "supersedes", "status")
+
+
+def usage(code=1):
+    print(__doc__, file=sys.stderr if code else sys.stdout)
+    sys.exit(code)
+
+
+def parse(argv):
+    opts, pos = {}, []
+    flags = {"--approved", "--card", "--drafts", "--list-drafts"}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            usage(0)
+        if a in flags:
+            opts[a[2:].replace("-", "_")] = True
+            i += 1
+        elif a == "--set":
+            if len(argv) - i < 4:
+                ac.die("--set needs <note> <field> <value>")
+            opts["set"] = argv[i + 1:i + 4]
+            i += 4
+        elif a.startswith("--"):
+            if i + 1 >= len(argv):
+                ac.die("%s needs a value" % a)
+            opts[a[2:].replace("-", "_")] = argv[i + 1]
+            i += 2
+        else:
+            pos.append(a)
+            i += 1
+    if pos:
+        ac.die("unexpected argument: %s" % pos[0])
+    return opts
+
+
+def resolve(path):
+    """Accept an absolute path, a vault-relative path, or a bare note name."""
+    cands = [path, os.path.join(VAULT, path)]
+    name = path if path.endswith(".md") else path + ".md"
+    for d in ac.SEARCHED + ("episodic", "_inbox"):
+        cands.append(os.path.join(VAULT, d, os.path.basename(name)))
+    for c in cands:
+        if os.path.isfile(c):
+            real = os.path.realpath(c)
+            if not real.startswith(os.path.realpath(VAULT) + os.sep):
+                ac.die("%s is outside the vault" % path)
+            return real
+    ac.die("note not found: %s" % path)
+
+
+def rel(path):
+    return os.path.relpath(path, VAULT)
+
+
+def read_body(opts):
+    if "body" in opts:
+        if opts["body"] != "-":
+            ac.die("--body takes '-' (read stdin); use --body-file for a file")
+        return sys.stdin.read()
+    if "body_file" in opts:
+        with open(opts["body_file"]) as f:
+            return f.read()
+    return None
+
+
+def check_domain(d):
+    known = ac.domains()
+    for k in known:
+        if k.lower() == d.lower():
+            return k
+    msg = "invalid --domain %r; it is not in %s/domains.txt.\nExisting domains:\n%s\n" % (
+        d, VAULT, "\n".join("  - " + k for k in known))
+    msg += "Domains stay few and broad. Ask the user before adding one with: anvil domain add <name>"
+    ac.die(msg)
+
+
+def check_description(desc):
+    desc = (desc or "").strip()
+    if not desc:
+        ac.die("--description is required: one line saying what the note claims and when it applies")
+    if "\n" in desc:
+        ac.die("--description must be one line")
+    if len(desc) > ac.DESCRIPTION_MAX:
+        ac.die("--description is %d chars; keep it under %d" % (len(desc), ac.DESCRIPTION_MAX))
+    return desc
+
+
+def check_origin(origin):
+    problem = ac.origin_problem(origin)
+    if problem:
+        ac.die(problem)
+    return (origin or "").strip()
+
+
+def check_body(body):
+    body = (body or "").strip()
+    if not body:
+        ac.die("a body is required (--body-file F or --body -): the claim and why, in short sentences")
+    words = len(body.split())
+    if words > 400:
+        print("warning: body is %d words; one claim per note reads best under ~200" % words, file=sys.stderr)
+    return body
+
+
+def compose_body(title, body):
+    body = body.strip()
+    # Accept a body that already starts with the title heading.
+    if body.startswith("# "):
+        first, _, rest = body.partition("\n")
+        return "# %s\n\n%s\n" % (first[2:].strip() or title, rest.strip())
+    return "# %s\n\n%s\n" % (title, body)
+
+
+def log_usage(domain, typ, path):
+    try:
+        os.makedirs(ac.state_dir(), exist_ok=True)
+        text = open(path).read()
+        with open(os.path.join(ac.state_dir(), "usage.tsv"), "a") as f:
+            f.write("%s\twrite\t%s\t%s\t%d\t%d\n" % (
+                datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), domain, typ,
+                len(text.split()), len(text)))
+    except Exception:
+        pass
+
+
+def link_moc(path, domain, subdomain):
+    title = domain[:1].upper() + domain[1:]
+    moc_dir = os.path.join(VAULT, "moc")
+    os.makedirs(moc_dir, exist_ok=True)
+    moc = os.path.join(moc_dir, title + ".md")
+    link = "- [[%s]]" % os.path.splitext(os.path.basename(path))[0]
+    text = open(moc).read() if os.path.exists(moc) else "# %s\n" % title
+    if link in text.splitlines():
+        return title
+    lines = text.rstrip("\n").split("\n")
+    if subdomain:
+        heading = "## " + subdomain[:1].upper() + subdomain[1:]
+        if heading in lines:
+            i = lines.index(heading) + 1
+            while i < len(lines) and lines[i].strip() == "":
+                i += 1
+            while i < len(lines) and lines[i].startswith("- "):
+                i += 1
+            lines.insert(i, link)
+        else:
+            lines += ["", heading, "", link]
+    else:
+        lines += ["", link] if len(lines) == 1 else [link]
+    with open(moc, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return title
+
+
+def unique_path(folder, slug):
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "%s-%s.md" % (TODAY, slug))
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(folder, "%s-%s-%d.md" % (TODAY, slug, n))
+        n += 1
+    return path
+
+
+def archive_superseded(name, new_path):
+    if not name:
+        return None
+    old = resolve(name)
+    f, order, body = ac.read_note(old)
+    f["status"] = "archived"
+    f["updated"] = TODAY
+    body = body.rstrip("\n") + "\n\nSuperseded by [[%s]].\n" % os.path.splitext(os.path.basename(new_path))[0]
+    ac.write_note(old, f, order, body)
+    return rel(old)
+
+
+def promote(path, fields, order, body):
+    """Move a note to its type folder as canonical and link it."""
+    typ = fields.get("type", "")
+    if typ not in ac.TYPES:
+        ac.die("draft has an invalid type %r" % typ)
+    fields["domain"] = check_domain(fields.get("domain", ""))
+    check_description(fields.get("description"))
+    check_origin(fields.get("origin"))
+    fields["status"] = "canonical"
+    fields["updated"] = TODAY
+    dest_dir = os.path.join(VAULT, typ)
+    dest = path
+    if os.path.dirname(path) != dest_dir:
+        dest = unique_path(dest_dir, re.sub(r"^\d{4}-\d{2}-\d{2}-", "", os.path.splitext(os.path.basename(path))[0]))
+    ac.write_note(dest, fields, order, body)
+    if dest != path:
+        os.remove(path)
+    msgs = ["wrote %s" % rel(dest)]
+    # Episodic notes (handoffs, dated events) stay out of the MOC files;
+    # /anvil:world is their index. A daily handoff would flood the MOCs.
+    if typ != "episodic":
+        moc = link_moc(dest, fields["domain"], fields.get("subdomain", ""))
+        msgs.append("linked from moc/%s.md" % moc)
+    old = archive_superseded(fields.get("supersedes"), dest)
+    if old:
+        msgs.append("archived superseded %s" % old)
+    log_usage(fields["domain"], typ, dest)
+    return dest, msgs
+
+
+def cmd_new(opts):
+    for req in ("type", "domain", "title"):
+        if not opts.get(req):
+            usage()
+    typ = opts["type"]
+    if typ not in ac.TYPES:
+        ac.die("invalid --type %r (semantic|procedural|strategic|episodic)" % typ)
+    source = opts.get("source") or os.environ.get("ANVIL_SOURCE", "human")
+    if source not in ac.SOURCES:
+        ac.die("invalid --source %r (claude|human)" % source)
+    title = opts["title"].strip()
+    if "\n" in title:
+        ac.die("--title must be one line")
+    domain = check_domain(opts["domain"])
+    desc = check_description(opts.get("description"))
+    body = check_body(read_body(opts))
+    origin = check_origin(opts["origin"] if "origin" in opts else ac.detect_origin())
+    supersedes = opts.get("supersedes", "")
+    if supersedes:
+        resolve(supersedes)
+    fields = {
+        "type": typ, "domain": domain, "subdomain": opts.get("subdomain", ""),
+        "project": opts.get("project", ""), "source": source, "origin": origin,
+        "status": "draft", "updated": TODAY, "tags": opts.get("tags", ""),
+        "description": desc, "supersedes": supersedes,
+    }
+    text = compose_body(title, body)
+    draft = unique_path(os.path.join(VAULT, "_inbox"), ac.slugify(title))
+    ac.write_note(draft, fields, [], text)
+    if opts.get("approved"):
+        _, msgs = promote(draft, fields, [], text)
+        print("\n".join(msgs))
+    else:
+        print("drafted %s (waiting in the inbox; recall does not see it)" % rel(draft))
+
+
+def cmd_approve(path):
+    path = resolve(path)
+    if os.path.dirname(path) != os.path.realpath(os.path.join(VAULT, "_inbox")):
+        ac.die("%s is not an _inbox/ draft" % rel(path))
+    fields, order, body = ac.read_note(path)
+    _, msgs = promote(path, fields, order, body)
+    print("\n".join(msgs))
+
+
+def cmd_reject(path):
+    path = resolve(path)
+    if os.path.dirname(path) != os.path.realpath(os.path.join(VAULT, "_inbox")):
+        ac.die("%s is not an _inbox/ draft; only drafts can be rejected" % rel(path))
+    # Rejected drafts are kept out of the way, not deleted, so a mistaken
+    # Reject can be undone with --restore. Recall never reads _archive/.
+    dest_dir = os.path.join(VAULT, "_archive", "rejected")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(path))
+    n = 2
+    while os.path.exists(dest):
+        base, ext = os.path.splitext(os.path.basename(path))
+        dest = os.path.join(dest_dir, "%s-%d%s" % (base, n, ext))
+        n += 1
+    os.replace(path, dest)
+    print("rejected %s (moved to %s; undo with: anvil note --restore %s)" % (
+        rel(path), rel(dest), os.path.basename(dest)))
+
+
+def unlink_moc(name):
+    """Remove the '- [[name]]' line from every moc/ file; return the ones changed."""
+    moc_dir = os.path.join(VAULT, "moc")
+    link = "- [[%s]]" % name
+    changed = []
+    for fn in sorted(os.listdir(moc_dir)) if os.path.isdir(moc_dir) else []:
+        p = os.path.join(moc_dir, fn)
+        lines = open(p).read().split("\n")
+        if link in lines:
+            with open(p, "w") as f:
+                f.write("\n".join(l for l in lines if l != link))
+            changed.append(fn)
+    return changed
+
+
+def cmd_unapprove(path):
+    """Take back an Approve: move a live note to the inbox as a draft, drop
+    its MOC link, and bring back the note it superseded."""
+    path = resolve(path)
+    typ_dirs = [os.path.realpath(os.path.join(VAULT, t)) for t in ac.TYPES]
+    if os.path.dirname(path) not in typ_dirs:
+        ac.die("%s is not a live note; only live notes can be unapproved" % rel(path))
+    fields, order, body = ac.read_note(path)
+    name = os.path.splitext(os.path.basename(path))[0]
+    if fields.get("status") != "canonical":
+        ac.die("%s has status %r; only canonical notes can be unapproved" % (rel(path), fields.get("status")))
+    # Refuse when other notes link to it: moving it would break those links.
+    backlinks = []
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [d for d in dirs if not d.startswith((".", "_")) and d != "moc"]
+        for fn in files:
+            p = os.path.join(root, fn)
+            if fn.endswith(".md") and p != path and "[[%s]]" % name in open(p).read():
+                backlinks.append(rel(p))
+    old = fields.get("supersedes")
+    if old:
+        old_path = resolve(old)
+        backlinks = [b for b in backlinks if b != rel(old_path)]
+    if backlinks:
+        ac.die("%s is linked from %s; remove those links first" % (rel(path), ", ".join(backlinks)))
+    fields["status"] = "draft"
+    fields["updated"] = TODAY
+    dest = os.path.join(VAULT, "_inbox", os.path.basename(path))
+    if os.path.exists(dest):
+        ac.die("%s already exists in the inbox" % rel(dest))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    ac.write_note(dest, fields, order, body)
+    os.remove(path)
+    msgs = ["unapproved %s (now the draft %s)" % (rel(path), rel(dest))]
+    for moc in unlink_moc(name):
+        msgs.append("unlinked from moc/%s" % moc)
+    if old:
+        f, o, b = ac.read_note(old_path)
+        f["status"] = "canonical"
+        f["updated"] = TODAY
+        b = b.replace("\n\nSuperseded by [[%s]].\n" % name, "\n")
+        ac.write_note(old_path, f, o, b)
+        msgs.append("restored superseded %s" % rel(old_path))
+    print("\n".join(msgs))
+
+
+def cmd_restore(name):
+    """Move a rejected draft back into the inbox."""
+    src = os.path.join(VAULT, "_archive", "rejected", os.path.basename(name))
+    if not src.endswith(".md"):
+        src += ".md"
+    if not os.path.isfile(src):
+        ac.die("no rejected draft named %s in _archive/rejected/" % os.path.basename(name))
+    dest = os.path.join(VAULT, "_inbox", os.path.basename(src))
+    if os.path.exists(dest):
+        ac.die("%s already exists in the inbox" % rel(dest))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.replace(src, dest)
+    print("restored %s" % rel(dest))
+
+
+def cmd_amend(path, opts):
+    path = resolve(path)
+    fields, order, body = ac.read_note(path)
+    new_body = read_body(opts)
+    if new_body is None and "description" not in opts:
+        ac.die("--amend needs a new body (--body-file/--body -) and/or --description")
+    title = ""
+    for line in body.splitlines():
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+    if new_body is not None:
+        body = compose_body(opts.get("title") or title or "Untitled", check_body(new_body))
+    if "description" in opts:
+        fields["description"] = check_description(opts["description"])
+    fields["updated"] = TODAY
+    ac.write_note(path, fields, order, body)
+    print("amended %s" % rel(path))
+
+
+def cmd_set(path, field, value):
+    path = resolve(path)
+    if field not in SETTABLE:
+        ac.die("--set supports: %s" % ", ".join(SETTABLE))
+    fields, order, body = ac.read_note(path)
+    if field == "origin":
+        value = check_origin(value)
+    elif field == "description":
+        value = check_description(value)
+    elif field == "status" and value not in ac.STATUSES:
+        ac.die("status must be one of %s" % ", ".join(ac.STATUSES))
+    elif field == "supersedes" and value:
+        resolve(value)
+    fields[field] = value
+    if field not in order:
+        order.append(field)
+    fields["updated"] = TODAY
+    ac.write_note(path, fields, order, body)
+    print("set %s on %s" % (field, rel(path)))
+
+
+def read_batch(field):
+    """Read '<note>\\t<value>' lines from stdin and check every one before
+    anything is written. Returns [(path, title, old, new)]."""
+    if field not in ("description", "origin", "project"):
+        ac.die("--batch supports: description, origin, project")
+    rows, problems = [], []
+    for n, line in enumerate(sys.stdin.read().splitlines(), 1):
+        if not line.strip():
+            continue
+        if "\t" not in line:
+            ac.die("line %d: expected <note><TAB><value>" % n)
+        name, value = (s.strip() for s in line.split("\t", 1))
+        path = resolve(name)
+        f, _, body = ac.read_note(path)
+        title = next((l[2:].strip() for l in body.splitlines() if l.startswith("# ")), rel(path))
+        if field == "origin":
+            problem = ac.origin_problem(value)
+        elif field == "project":
+            problem = None if re.match(r"^[a-z0-9][a-z0-9-]*$", value) else \
+                "a project is one lowercase name, such as orion or bt-engine"
+        elif not value or len(value) > ac.DESCRIPTION_MAX:
+            problem = "a description is one line under %d characters" % ac.DESCRIPTION_MAX
+        else:
+            problem = None
+        if problem:
+            problems.append("line %d (%s): %s" % (n, rel(path), problem))
+        rows.append((path, title, f.get(field, "") or "", value))
+    if problems:
+        ac.die("the batch was not checked clean:\n  " + "\n  ".join(problems))
+    if not rows:
+        ac.die("the batch is empty")
+    return rows
+
+
+def cmd_batch_card(field, of, rows):
+    """Plain-text card for one backfill batch, same layout rules as
+    render_question: no markdown, no hard wraps."""
+    head = "BACKFILL · %s%s" % (field.upper(), " · BATCH " + of.upper() if of else "")
+    # Full values here: an old ssh remote (forgejo:<owner>/<repo>) would look
+    # the same as the short label of its new web link.
+    shown = lambda v: v or "(empty)"
+    same = len({r[3] for r in rows}) == 1 and len(rows) > 1
+    out = ["📝 " + head, ""]
+    if same:
+        out += ["Proposed %s · %s" % (field, shown(rows[0][3])), "for these %d notes:" % len(rows), ""]
+    for i, (path, title, old, new) in enumerate(rows, 1):
+        out.append("%d. %s" % (i, title))
+        if not same:
+            out.append("→ %s" % shown(new))
+        if old:
+            out.append("was · %s" % old)
+        out.append("")
+    out += ["━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "Approve all %d, or type changes (\"skip 3; 5: <new value>\")." % len(rows)]
+    print("\n".join(out))
+
+
+def cmd_batch_apply(field, rows):
+    """Write one backfill batch and keep the old values so one command
+    can undo the whole batch."""
+    bid = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bdir = os.path.join(ac.state_dir(), "batches")
+    os.makedirs(bdir, exist_ok=True)
+    with open(os.path.join(bdir, bid + ".tsv"), "w") as log:
+        log.write("#field\t%s\n" % field)
+        for path, _, old, new in rows:
+            log.write("%s\t%s\n" % (rel(path), old))
+    for path, _, old, new in rows:
+        cmd_set(path, field, new)
+    print("batch %s: set %s on %d notes (undo with: anvil note --undo-batch %s --approved)" % (
+        bid, field, len(rows), bid))
+
+
+def cmd_undo_batch(bid):
+    log = os.path.join(ac.state_dir(), "batches", os.path.basename(bid) + ".tsv")
+    if not os.path.isfile(log):
+        ac.die("no batch named %s" % bid)
+    lines = open(log).read().splitlines()
+    field = lines[0].split("\t", 1)[1]
+    n = 0
+    for line in lines[1:]:
+        name, old = line.split("\t", 1)
+        path = resolve(name)
+        fields, order, body = ac.read_note(path)
+        fields[field] = old
+        fields["updated"] = TODAY
+        ac.write_note(path, fields, order, body)
+        n += 1
+    os.replace(log, log + ".undone")
+    print("undid batch %s: %s restored on %d notes" % (bid, field, n))
+
+
+def cmd_drafts():
+    inbox = os.path.join(VAULT, "_inbox")
+    names = sorted(n for n in os.listdir(inbox) if n.endswith(".md")) if os.path.isdir(inbox) else []
+    if not names:
+        print("No drafts in the inbox.")
+        return
+    for n in names:
+        f, _, body = ac.read_note(os.path.join(inbox, n))
+        title = next((l[2:].strip() for l in body.splitlines() if l.startswith("# ")), n)
+        print("_inbox/%s\n  %s | %s/%s | origin: %s\n  %s" % (
+            n, f.get("type", "?"), f.get("domain", "?"), f.get("subdomain", "") or "-",
+            f.get("origin", "") or "(none)", f.get("description", "") or title))
+
+
+def cmd_list_drafts():
+    inbox = os.path.join(VAULT, "_inbox")
+    if os.path.isdir(inbox):
+        for n in sorted(n for n in os.listdir(inbox) if n.endswith(".md")):
+            print("_inbox/%s" % n)
+
+
+def link_status(origin):
+    """(passed: bool, one-line result) from libexec/link-check."""
+    if not origin:
+        return True, "no origin"
+    import subprocess
+    lc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "link-check")
+    try:
+        res = subprocess.run([lc, origin], capture_output=True, text=True, timeout=120)
+        out = (res.stdout or res.stderr).strip().splitlines()
+        msg = out[-1] if out else "no result"
+    except Exception as e:
+        return False, "link check failed to run: %s" % e
+    msg = re.sub(r"^(ok|fail):\s*", "", msg)
+    return res.returncode == 0, msg
+
+
+def render_question(head, title, f, domain, tags, passed, result, text, part=""):
+    """Card for the question text itself: plain text only (no markdown marks,
+    which a question dialog may show raw), one field per line (no column
+    alignment, which breaks in a proportional font), and no hard wraps, so
+    each client wraps to its own width."""
+    origin = f.get("origin", "")
+    link = ("✅ " if passed else "❌ ") + re.sub(r"\s*\(.*\)$", "", result)
+
+    def plain(t):
+        # Unwrap each paragraph, but keep headings and list items ("- ", "1. ") on
+        # their own lines.
+        out = []
+        for p in t.split("\n\n"):
+            items = []
+            for line in p.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if items and not re.match(r"^([-*] |\d+\. |#)", line) \
+                        and not items[-1].startswith("#"):
+                    items[-1] += " " + line
+                else:
+                    items.append(line)
+            if items:
+                out.append("\n".join(" ".join(i.split()) for i in items).replace("`", ""))
+        return "\n\n".join(out)
+
+    body = [plain(text)]
+    out = ["📝 %s" % head.upper(), ""]
+    # A draft that replaces a live note is reviewed as two cards, because
+    # the dialog cuts off tall text and cannot scroll: part="before" is the
+    # live note alone, and the default card is the new version.
+    if f.get("supersedes"):
+        of, _, ob = ac.read_note(resolve(f["supersedes"]))
+        olines = ob.strip().splitlines()
+        otitle = olines[0][2:].strip() if olines and olines[0].startswith("# ") else f["supersedes"]
+        if olines and olines[0].startswith("# "):
+            olines = olines[1:]
+        if part == "before":
+            odomain = of.get("domain", "?") + (" › " + of["subdomain"] if of.get("subdomain") else "")
+            return "\n".join([
+                "📝 %s · BEFORE" % head.upper(), "",
+                "The live note. It is archived if you approve the new version.", "",
+                otitle, "",
+                "“%s”" % (of.get("description") or "no description"), "",
+                "━━━━━━━━  DETAILS  ━━━━━━━━",
+                "Type · %s" % (of.get("type") or "?"),
+                "Domain · %s" % odomain,
+                "Project · %s" % (of.get("project") or "none"),
+                "Tags · %s" % (" · ".join(ac.parse_tags(of.get("tags", ""))) or "none"),
+                "Origin · %s" % (of.get("origin") or "none"),
+                "Updated · %s" % (of.get("updated") or "?"), "",
+                "━━━━━━━━━  NOTE  ━━━━━━━━━", "",
+                plain("\n".join(olines)), "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "Next: the new version.",
+            ])
+        out[0] += " · AFTER"
+    out += [
+        title,
+        "",
+        "“%s”" % (f.get("description") or "no description"),
+        "",
+        "━━━━━━━━  DETAILS  ━━━━━━━━",
+        "Type · %s" % (f.get("type") or "?"),
+        "Domain · %s" % domain,
+        "Project · %s" % (f.get("project") or "none"),
+        "Tags · %s" % (" · ".join(tags) or "none"),
+        "Origin · %s  %s" % (origin or "none", link),
+    ]
+    if f.get("supersedes"):
+        out.append("Replaces · %s" % otitle)
+    out += ["", "━━━━━━━━━  NOTE  ━━━━━━━━━", ""]
+    out.append("\n\n".join(body))
+    out += ["", "━━━━━━━━━━━━━━━━━━━━━━━━━━", "What should happen to this draft?"]
+    return "\n".join(out)
+
+
+def cmd_review(path, of, part=""):
+    """Print one draft as the plain-text card the review question shows;
+    part="before" prints the live note a --supersedes draft replaces.
+    Exit 3 when the draft's origin link does not resolve."""
+    path = resolve(path)
+    f, _, body = ac.read_note(path)
+    lines = body.strip().splitlines()
+    title = rel(path)
+    if lines and lines[0].startswith("# "):
+        title = lines[0][2:].strip()
+        lines = lines[1:]
+    text = "\n".join(lines).strip()
+    passed, result = link_status(f.get("origin", ""))
+    domain = f.get("domain", "?") + (" › " + f["subdomain"] if f.get("subdomain") else "")
+    tags = ac.parse_tags(f.get("tags", ""))
+    head = "Draft %s" % of if of else "Draft"
+    print(render_question(head, title, f, domain, tags, passed, result, text, part))
+    if not passed:
+        sys.exit(3)
+
+
+def main():
+    opts = parse(sys.argv[1:])
+    if not os.path.isdir(VAULT):
+        ac.die("anvil vault not found at %s (set ANVIL_HOME or run ai/blacksmith/install.sh)" % VAULT)
+    if opts.get("drafts"):
+        return cmd_drafts()
+    if opts.get("list_drafts"):
+        return cmd_list_drafts()
+    if "review" in opts:
+        return cmd_review(opts["review"], opts.get("of", ""), opts.get("part", ""))
+    if "restore" in opts:
+        return cmd_restore(opts["restore"])
+    if "check_origin" in opts:
+        problem = ac.origin_problem(opts["check_origin"])
+        if problem:
+            print(problem)
+            sys.exit(1)
+        print("ok")
+        return
+    if "batch" in opts and opts.get("card"):
+        return cmd_batch_card(opts["batch"], opts.get("of", ""), read_batch(opts["batch"]))
+    for mode in ("approve", "unapprove", "reject", "amend", "set", "batch", "undo_batch"):
+        if mode in opts:
+            if not opts.get("approved"):
+                ac.die("--%s changes the vault and needs --approved (pass it only after the user approved)" % mode)
+            if mode == "approve":
+                return cmd_approve(opts["approve"])
+            if mode == "unapprove":
+                return cmd_unapprove(opts["unapprove"])
+            if mode == "reject":
+                return cmd_reject(opts["reject"])
+            if mode == "batch":
+                return cmd_batch_apply(opts["batch"], read_batch(opts["batch"]))
+            if mode == "undo_batch":
+                return cmd_undo_batch(opts["undo_batch"])
+            if mode == "amend":
+                return cmd_amend(opts["amend"], opts)
+            return cmd_set(*opts["set"])
+    return cmd_new(opts)
+
+
+if __name__ == "__main__":
+    main()

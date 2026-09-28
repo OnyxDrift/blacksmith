@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Hook launcher: runs one of the Python hooks in this folder with the Python
+# the installer found (../../lib/find-python.sh), not its shebang, which
+# names python3 (missing or a Store stub on Windows).
+#
+#   hooks.json:  "${CLAUDE_PLUGIN_ROOT}/hooks/run" guard-vault
+#
+# With no Python, it lets the tool call through (exit 0) and says why on
+# stderr: a broken hook must not block every Write or Bash call.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../../lib/find-python.sh
+. "$(dirname "$(dirname "$DIR")")/lib/find-python.sh"
+PY="$(bs_python)" || { echo "anvil hook $1: no Python 3.8+ found; hook skipped" >&2; exit 0; }
+exec "$PY" "$DIR/$1"

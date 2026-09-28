@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Usage: show <note>
+# Prints one note in full. <note> is a name from recall output (with or
+# without .md), or a vault-relative path. Only canonical notes are shown:
+# the folders recall searches, plus episodic/ (handoffs and dated events,
+# which /anvil:world and /anvil:backfill open). Drafts and archived notes
+# stay out.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+NAME="${1:-}"
+if [ -z "$NAME" ]; then
+  echo "usage: show <note>" >&2
+  exit 1
+fi
+NAME="${NAME%.md}"
+NAME="${NAME#"$ANVIL_ROOT"/}"
+
+for d in semantic procedural strategic episodic; do
+  for cand in "$ANVIL_ROOT/$NAME.md" "$ANVIL_ROOT/$d/$(basename "$NAME").md"; do
+    case "$cand" in "$ANVIL_ROOT/$d/"*) ;; *) continue ;; esac
+    if [ -f "$cand" ]; then
+      if ! grep -qx "status: canonical" "$cand"; then
+        echo "error: $NAME is not canonical; recall and show read approved notes only" >&2
+        exit 1
+      fi
+      cat "$cand"
+      exit 0
+    fi
+  done
+done
+echo "error: no canonical note named $NAME" >&2
+exit 1

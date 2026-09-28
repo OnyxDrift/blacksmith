@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Usage: session-read <path-to-session.jsonl>
+# Prints ONLY the conversational text (user + assistant text blocks) from
+# a Claude Code .jsonl transcript, with secrets removed (lib/redact.py).
+# Deliberately drops tool_use/tool_result content, which can be huge and
+# isn't what /hydrate needs to read to extract durable claims.
+# `--engine claude` is still accepted for older callers; Claude Code is
+# the only engine anvil reads.
+# Read-only.
+set -euo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../../lib/find-python.sh
+. "$(dirname "$(dirname "$SELF_DIR")")/lib/find-python.sh"
+ANVIL_PY="$(bs_python || true)"
+
+LOG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --engine)
+      if [ "${2:-}" != "claude" ]; then
+        echo "error: only --engine claude is supported (anvil reads Claude Code sessions only)" >&2
+        exit 1
+      fi
+      shift 2 ;;
+    *) LOG="$1"; shift ;;
+  esac
+done
+
+if [ -z "$LOG" ]; then
+  echo "usage: session-read <path-to-session.jsonl>" >&2
+  exit 1
+fi
+
+if [ ! -f "$LOG" ]; then
+  echo "error: $LOG not found" >&2
+  exit 1
+fi
+
+if [ -z "$ANVIL_PY" ]; then
+  echo "error: Python 3.8+ is required to parse session logs" >&2
+  exit 1
+fi
+
+# lib/ sits next to libexec/ in the anvil package.
+REDACT_DIR=""
+for d in "$SELF_DIR/../lib" "$SELF_DIR/lib"; do
+  [ -f "$d/redact.py" ] && REDACT_DIR="$(cd "$d" && pwd)" && break
+done
+if [ -z "$REDACT_DIR" ]; then
+  echo "error: lib/redact.py not found next to $SELF_DIR — refusing to print an unredacted transcript" >&2
+  exit 1
+fi
+
+"$ANVIL_PY" - "$LOG" "$REDACT_DIR" <<'PY'
+import json, sys
+sys.stdout.reconfigure(newline="\n")
+
+path, redact_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, redact_dir)
+from redact import redact, summary
+
+totals = {}
+out = []
+with open(path, "r", errors="replace") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+
+        rtype = row.get("type")
+        if rtype not in ("user", "assistant"):
+            continue
+
+        message = row.get("message") or {}
+        role = message.get("role", rtype)
+        content = message.get("content")
+        ts = row.get("timestamp", "")
+
+        texts = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+                # tool_use / tool_result / other block types deliberately skipped
+
+        text = "\n".join(t for t in texts if t).strip()
+        if not text:
+            continue
+        # Skip Skill-invocation boilerplate wrapper text, not real content
+        if text.startswith("<command-message>") or text.startswith("Base directory for this skill:"):
+            continue
+
+        text, counts = redact(text)
+        for k, v in counts.items():
+            totals[k] = totals.get(k, 0) + v
+        out.append(f"[{role}] {ts}\n{text}\n")
+
+try:
+    sys.stdout.write("\n".join(out))
+    sys.stdout.flush()
+except BrokenPipeError:
+    sys.stderr.close()
+    sys.exit(0)
+if totals:
+    print(f"(session-read: {summary(totals)})", file=sys.stderr)
+PY

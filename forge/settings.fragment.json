@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(forge *)"
+    ],
+    "deny": [
+      "Read(//**/.env)",
+      "Read(//**/.env.local)"
+    ]
+  },
+  "sandbox": {
+    "filesystem": {
+      "denyRead": [
+        "~/**/.env",
+        "~/**/.env.local"
+      ]
+    }
+  }
+}

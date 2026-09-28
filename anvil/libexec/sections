@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""anvil sections — read a long ingested source one section at a time.
+
+  anvil sections <raw>              numbered section list with word counts
+  anvil sections <raw> <n>[,<n>…]   print only those sections (ranges: 3-5)
+
+<raw> is a raw/ path from `anvil ingest`, or just its file name. The list
+costs no reading: it lets /anvil:ingest skim a long paper (abstract,
+introduction, conclusion) and then read only the sections behind the
+claims the user picked, instead of the whole document.
+"""
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import anvil_common as ac  # noqa: E402
+
+
+def resolve(name):
+    raw = os.path.join(ac.vault(), "raw")
+    base = os.path.basename(name)
+    for cand in (os.path.join(ac.vault(), name), os.path.join(raw, base), os.path.join(raw, base + ".md")):
+        if os.path.isfile(cand):
+            return cand
+    # A name without its date prefix, if exactly one raw copy ends with it.
+    stem = base[:-3] if base.endswith(".md") else base
+    hits = [n for n in os.listdir(raw) if n.endswith(stem + ".md")] if os.path.isdir(raw) else []
+    if len(hits) == 1:
+        return os.path.join(raw, hits[0])
+    ac.die("no raw copy named %s (see the raw: line that anvil ingest printed)" % name)
+
+
+def split(path):
+    """[(level, title, [lines])] with the frontmatter dropped; text before
+    the first heading becomes section 'Preamble'."""
+    lines = open(path).read().splitlines()
+    if lines and lines[0] == "---":
+        end = lines.index("---", 1) if "---" in lines[1:] else 0
+        lines = lines[end + 1:]
+    out, cur = [], [0, "Preamble", []]
+    fence = False
+    for line in lines:
+        if line.startswith("```"):
+            fence = not fence
+        m = None if fence else re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            if cur[2] and any(l.strip() for l in cur[2]) or cur[1] != "Preamble":
+                out.append(tuple(cur))
+            title = re.sub(r"[*_`]", "", m.group(2)).strip()
+            cur = [len(m.group(1)), title, []]
+        else:
+            cur[2].append(line)
+    out.append(tuple(cur))
+    return out
+
+
+def words(lines):
+    return sum(len(l.split()) for l in lines)
+
+
+def pick(spec, n):
+    chosen = []
+    for part in spec.split(","):
+        part = part.strip()
+        if re.match(r"^\d+-\d+$", part):
+            a, b = (int(x) for x in part.split("-"))
+            chosen += range(a, b + 1)
+        elif part.isdigit():
+            chosen.append(int(part))
+        else:
+            ac.die("section numbers look like 3 or 3,5 or 3-5, not %r" % part)
+    bad = [c for c in chosen if not 1 <= c <= n]
+    if bad:
+        ac.die("no section %s; this source has %d" % (bad[0], n))
+    return chosen
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    secs = split(resolve(argv[0]))
+    if len(argv) == 1:
+        total = sum(words(s[2]) for s in secs)
+        print("%s: %d sections, %d words" % (argv[0], len(secs), total))
+        for i, (level, title, body) in enumerate(secs, 1):
+            print("%3d. %s%s (%d)" % (i, "  " * max(level - 1, 0), title, words(body)))
+        return 0
+    for i in pick(argv[1], len(secs)):
+        level, title, body = secs[i - 1]
+        print("%s %s\n" % ("#" * max(level, 1), title))
+        print("\n".join(body).strip())
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

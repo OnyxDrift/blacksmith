@@ -1,0 +1,5 @@
+# LF line endings in every checkout, also on Windows: bash scripts with CRLF
+# fail ($'\r': command not found), and so do the Python helpers they read.
+* text=auto eol=lf
+*.jpg binary
+*.png binary

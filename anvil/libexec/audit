@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Usage: audit --field <name> | audit --bad-origin
+# Prints the vault-relative path of every canonical note where frontmatter
+# key <name> is missing entirely or present but empty. Read-only.
+#
+# This is the shared implementation behind `anvil status`'s "missing <field>"
+# warnings and /anvil:backfill's list of what to propose values for — one
+# check, not two copies that can drift apart.
+#
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+FIELD=""
+BAD_ORIGIN=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --field) FIELD="$2"; shift 2 ;;
+    --bad-origin) BAD_ORIGIN=true; shift ;;
+    *) echo "unknown arg: $1" >&2; echo "usage: audit --field <name> | audit --bad-origin" >&2; exit 1 ;;
+  esac
+done
+
+# --bad-origin: canonical notes whose origin breaks the current rules (e.g.
+# a local path or an ssh remote from before the rules existed).
+if [ "$BAD_ORIGIN" = true ]; then
+  "$ANVIL_PY" - "$ANVIL_PKG/lib" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import anvil_common as ac
+root = ac.vault()
+for d in ac.SEARCHED + ("episodic",):
+    folder = os.path.join(root, d)
+    if not os.path.isdir(folder):
+        continue
+    for n in sorted(os.listdir(folder)):
+        if not n.endswith(".md"):
+            continue
+        f, _, _ = ac.read_note(os.path.join(folder, n))
+        if f.get("status") == "canonical" and ac.origin_problem(f.get("origin")):
+            print("%s/%s\t%s" % (d, n, f.get("origin")))
+PY
+  exit 0
+fi
+
+if [ -z "$FIELD" ]; then
+  echo "usage: audit --field <name> | audit --bad-origin" >&2
+  exit 1
+fi
+
+NOTE_DIRS="$ANVIL_ROOT/semantic $ANVIL_ROOT/procedural $ANVIL_ROOT/strategic $ANVIL_ROOT/episodic"
+ALL_NOTES=$(find $NOTE_DIRS -maxdepth 1 -name '*.md' 2>/dev/null || true)
+
+for f in $ALL_NOTES; do
+  if grep -q "^status: canonical$" "$f" 2>/dev/null; then
+    if ! grep -q "^${FIELD}:[[:space:]]*[^[:space:]]" "$f" 2>/dev/null; then
+      # Vault-relative path (e.g. semantic/2026-...-title.md), matching
+      # how every other anvil script reports note paths.
+      echo "${f#"$ANVIL_ROOT"/}"
+    fi
+  fi
+done

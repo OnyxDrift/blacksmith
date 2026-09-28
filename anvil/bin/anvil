@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Usage: anvil <command> [args...]
+# The one anvil executable on PATH. Claude Code adds the plugin's bin/ to
+# PATH inside sessions; install.sh adds it for terminals. Every other
+# script lives in libexec/ so generic names (note, status) stay off PATH.
+set -euo pipefail
+# Resolve symlinks so a linked `anvil` still finds its package.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+done
+. "$(cd "$(dirname "$SELF")/.." && pwd)/lib/common.sh"
+LIBEXEC="$ANVIL_PKG/libexec"
+
+usage() {
+  cat <<EOF
+Usage: anvil <command> [args...]
+
+Notes:
+  recall [--full] <topic>      Search approved notes (at most 4); compact by default
+  show <note>                   Print one approved note in full
+  note [args...]                Draft, approve, amend, or reject notes (see: anvil note --help)
+  domain add <name>             Add a domain to domains.txt and create its moc/ file
+  ingest <url|path> [--pick page|pdf|both]
+                                Save a clean copy of a page, PDF, or file to raw/
+  sections <raw> [n[,n…]]       List a raw copy's sections with word counts,
+                                or print only the sections named
+  source [--list] <note|link>   Follow a note to what backs it, read-only
+                                (another repo's writeup, or an ingested copy)
+  world [<project> | journal [word]]
+                                Latest handoff per project, and the journal
+
+Vault health:
+  status                        Counts, domain tree, drift, orphans, versions
+  audit --field <name>          List canonical notes missing that field
+  usage                         This machine's read/write activity
+
+Schema:
+  migrate [--dry-run]           Run outstanding note-schema migrations
+  link-check <origin>           Check a note origin resolves (host link, source, raw/)
+
+Sessions (used by /anvil:hydrate):
+  sessions [--exclude <id>] [--pretty]
+                                List Claude Code sessions from here down
+  sessions --record <id> <status> <n> [detail]
+                                Record a session's hydrate progress
+  session-read <path>           Print a session's text, secrets removed
+
+Companion tools (optional):
+  extras                        Install emeraldian, a terminal vault viewer
+  open [path]                   Open a vault in emeraldian (default: this vault)
+
+Other:
+  path [--state|--home]         Print the vault root (or the state dir, or ~/.blacksmith)
+  version                       Print tooling and schema versions
+  help                          Show this message
+
+Vault: $ANVIL_ROOT
+EOF
+}
+
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$CMD" in
+  recall|note|show|world|ingest|sections|source|status|usage|audit|migrate|sessions|session-read|domain|link-check)
+    # A Python command runs with the Python the installer found, not its
+    # shebang, which names python3 (missing or a Store stub on Windows).
+    if head -n 1 "$LIBEXEC/$CMD" | grep -q python; then
+      anvil_need_python
+      exec "$ANVIL_PY" "$LIBEXEC/$CMD" "$@"
+    fi
+    exec "$LIBEXEC/$CMD" "$@"
+    ;;
+  path)
+    case "${1:-}" in
+      --state) echo "$ANVIL_STATE" ;;
+      --home) echo "$BLACKSMITH_HOME" ;;
+      *) echo "$ANVIL_ROOT" ;;
+    esac
+    ;;
+  version)
+    echo "tooling $(anvil_tooling_version)"
+    echo "schema  $(tr -d '[:space:]' < "$ANVIL_PKG/SCHEMA_VERSION")"
+    ;;
+  extras)
+    echo "Optional companion tools for anvil (none required):"
+    echo
+    echo "  emeraldian — a TUI that reads an Obsidian-format vault (the same"
+    echo "  plain markdown anvil writes) and shows notes plus a graph, in the"
+    echo "  terminal. https://github.com/iamrohithrnair/emeraldian"
+    echo
+    if command -v emeraldian >/dev/null 2>&1; then
+      echo "Already installed: $(command -v emeraldian)"
+      exit 0
+    fi
+    if command -v brew >/dev/null 2>&1; then
+      echo "Installing emeraldian via Homebrew..."
+      brew install iamrohithrnair/tap/emeraldian
+      echo
+      echo "Installed. Try: anvil open"
+    else
+      echo "Homebrew not found — install manually with one of:"
+      echo "  cargo install emeraldian"
+      echo "  curl -fsSL https://emeraldian-tui.github.io/install.sh | sh"
+      echo "Then: anvil open"
+    fi
+    ;;
+  open)
+    TARGET="${1:-$ANVIL_ROOT}"
+    if ! command -v emeraldian >/dev/null 2>&1; then
+      echo "error: emeraldian is not installed. Run: anvil extras" >&2
+      exit 1
+    fi
+    if [ ! -d "$TARGET" ]; then
+      echo "error: $TARGET is not a directory" >&2
+      exit 1
+    fi
+    exec emeraldian "$TARGET"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "unknown command: $CMD" >&2
+    usage
+    exit 1
+    ;;
+esac

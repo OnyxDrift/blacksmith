@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Usage: recall [--full] <topic>
+# Searches canonical notes in semantic/, procedural/, and strategic/ for a
+# literal, case-insensitive match. Prints at most 4 hits.
+#
+# Only the claim is searched: title, description, tags, project, subdomain,
+# and body. Not origin (every note from one repo shares its URL, so a repo
+# name matched them all) and not dates or status. Hits in the title,
+# description, tags, or project rank above body-only hits.
+#
+# Default output is compact: path, title, description, updated, origin —
+# about 40 tokens per hit, so the agent can judge relevance and open only
+# the note it needs (`anvil show <note>`). --full prints whole notes.
+# Drafts (_inbox/), episodic notes, raw/ copies, and archived notes are
+# never returned.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+FULL=false
+if [ "${1:-}" = "--full" ]; then
+  FULL=true
+  shift
+fi
+QUERY="$*"
+if [ -z "$QUERY" ]; then
+  echo "usage: recall [--full] <topic>" >&2
+  exit 1
+fi
+
+# Local usage log — machine-local only, deliberately kept outside the vault
+# so it never syncs via Syncthing. Never let logging failures break a read.
+log_usage() {
+  {
+    mkdir -p "$ANVIL_STATE"
+    printf '%s\tread\t%s\t%s\t%s\t%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$QUERY" "$1" "$2" "$3" >> "$ANVIL_STATE/usage.tsv"
+  } 2>/dev/null || true
+}
+
+field() {
+  # field <file> <key>: first frontmatter value for key, quotes stripped and
+  # the escapes of a double-quoted value (\\ and \") undone
+  sed -n "2,/^---\$/{s/^$2:[[:space:]]*//p;}" "$1" | head -n 1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e 's/\\\\/\\/g' -e 's/\\"/"/g'
+}
+
+CANON_FILES=$(grep -rlx "status: canonical" \
+  "$ANVIL_ROOT/semantic" "$ANVIL_ROOT/procedural" "$ANVIL_ROOT/strategic" 2>/dev/null | sort || true)
+
+if [ -z "$CANON_FILES" ]; then
+  echo "No canonical notes yet."
+  log_usage 0 0 0
+  exit 0
+fi
+
+# Plain loop, not `xargs -I`: macOS xargs -I silently drops any command
+# longer than 255 bytes, which broke recall for vaults at long paths.
+# Each hit is ranked by the first place it matches: 1 title, 2 description,
+# 3 tags, 4 project or subdomain, 5 body only. A note where the query
+# appears only inside longer words ("sed" in "based") drops below every
+# whole-word hit (rank + 5); substring hits still count, so "walk" finds
+# "walk-forward". Sort by rank, then newest first, and keep the first 4.
+has() { printf '%s' "$1" | grep -qiF -- "$QUERY"; }
+has_word() { printf '%s' "$1" | grep -qiwF -- "$QUERY"; }
+RANKED=""
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  T=$(grep -m1 '^# ' "$f"); D=$(field "$f" description); G=$(field "$f" tags)
+  P="$(field "$f" project) $(field "$f" subdomain)"
+  B=$(awk 'n >= 2 { print } /^---$/ { n++ }' "$f")
+  if has "$T"; then R=1
+  elif has "$D"; then R=2
+  elif has "$G"; then R=3
+  elif has "$P"; then R=4
+  elif has "$B"; then R=5
+  else continue
+  fi
+  has_word "$T
+$D
+$G
+$P
+$B" || R=$((R + 5))
+  RANKED="${RANKED}${R}	$(field "$f" updated)	$f
+"
+done <<EOF_CANON
+$CANON_FILES
+EOF_CANON
+TOTAL=$(printf '%s' "$RANKED" | grep -c . || true)
+MATCHES=$(printf '%s' "$RANKED" | sort -t '	' -k1,1n -k2,2r -k3,3 | head -n 4 | cut -f1,3)
+
+if [ -z "$MATCHES" ]; then
+  echo "No canonical notes match: $QUERY"
+  log_usage 0 0 0
+  exit 0
+fi
+
+OUT="$(mktemp)"
+trap 'rm -f "$OUT"' EXIT
+HIT_COUNT=0
+while IFS='	' read -r RANK f; do
+  [ -z "$f" ] && continue
+  HIT_COUNT=$((HIT_COUNT + 1))
+  PARTIAL=""
+  [ "$RANK" -gt 5 ] && PARTIAL=" · partial match: only inside longer words"
+  REL="${f#"$ANVIL_ROOT"/}"
+  if [ "$FULL" = true ]; then
+    { echo "----- $REL${PARTIAL:+ (partial match: only inside longer words)} -----"; cat "$f"; echo; } >> "$OUT"
+  else
+    TITLE=$(grep -m1 '^# ' "$f" | sed 's/^# //')
+    DESC=$(field "$f" description)
+    {
+      echo "$HIT_COUNT. $REL"
+      echo "   $TITLE"
+      echo "   ${DESC:-(no description yet — open it with: anvil show $(basename "$f" .md))}"
+      O=$(field "$f" origin)
+      [ "$O" = "none" ] && O=""
+      echo "   updated $(field "$f" updated)${O:+ · origin $O}$PARTIAL"
+    } >> "$OUT"
+  fi
+done <<EOF_MATCHES
+$MATCHES
+EOF_MATCHES
+
+[ "$TOTAL" -gt "$HIT_COUNT" ] && \
+  echo "$((TOTAL - HIT_COUNT)) more notes match; search a more specific word to see them." >> "$OUT"
+[ "$FULL" = false ] && echo "Open a note in full with: anvil show <name>" >> "$OUT"
+cat "$OUT"
+log_usage "$HIT_COUNT" "$(wc -w < "$OUT" | tr -d ' ')" "$(wc -c < "$OUT" | tr -d ' ')"

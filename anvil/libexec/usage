@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Usage: usage
+# Summarizes anvil read/write activity on THIS machine only, from a local
+# log kept outside $ANVIL_ROOT (see note/recall) so it never syncs via
+# Syncthing — one machine's usage never mixes with another's.
+# Read-only — never writes anything except its own understanding is nothing;
+# note/recall are the only writers of the log file.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+LOG_DIR="$ANVIL_STATE"
+LOG_FILE="$LOG_DIR/usage.tsv"
+
+echo "=== anvil usage (this machine only): $LOG_FILE ==="
+echo
+
+if [ ! -f "$LOG_FILE" ] || [ ! -s "$LOG_FILE" ]; then
+  echo "No usage recorded yet on this machine."
+  echo "This log only grows as note/recall run here — it never syncs, so"
+  echo "a different machine, or a fresh install here, starts empty."
+  exit 0
+fi
+
+WRITE_COUNT=$(awk -F'\t' '$2=="write"' "$LOG_FILE" | wc -l | tr -d ' ')
+READ_COUNT=$(awk -F'\t' '$2=="read"' "$LOG_FILE" | wc -l | tr -d ' ')
+READ_HIT_COUNT=$(awk -F'\t' '$2=="read" && $4+0>0' "$LOG_FILE" | wc -l | tr -d ' ')
+
+echo "Totals (all time, this machine):"
+printf "  writes: %s\n" "$WRITE_COUNT"
+printf "  reads:  %s\n" "$READ_COUNT"
+if [ "$READ_COUNT" -gt 0 ]; then
+  HIT_RATE=$(awk -v h="$READ_HIT_COUNT" -v t="$READ_COUNT" 'BEGIN{printf "%.0f", (h/t)*100}')
+  printf "  read hit rate: %s%% (%s of %s reads found a matching note)\n" "$HIT_RATE" "$READ_HIT_COUNT" "$READ_COUNT"
+fi
+echo
+
+echo "Estimated token cost (rough: ~4 characters per token, no real tokenizer):"
+if [ "$WRITE_COUNT" -gt 0 ]; then
+  AVG_WRITE_CHARS=$(awk -F'\t' '$2=="write"{s+=$6; n++} END{if(n>0) printf "%.0f", s/n; else print 0}' "$LOG_FILE")
+  AVG_WRITE_TOKENS=$((AVG_WRITE_CHARS / 4))
+  printf "  avg per write: ~%s tokens\n" "$AVG_WRITE_TOKENS"
+  echo "    (measured at creation time, before the body is filled in by a"
+  echo "    follow-up edit — this undercounts the real finished note size)"
+else
+  echo "  avg per write: n/a (no writes logged yet)"
+fi
+if [ "$READ_HIT_COUNT" -gt 0 ]; then
+  AVG_READ_CHARS=$(awk -F'\t' '$2=="read" && $4+0>0{s+=$6; n++} END{if(n>0) printf "%.0f", s/n; else print 0}' "$LOG_FILE")
+  AVG_READ_TOKENS=$((AVG_READ_CHARS / 4))
+  printf "  avg per successful recall: ~%s tokens returned\n" "$AVG_READ_TOKENS"
+else
+  echo "  avg per successful recall: n/a (no hits logged yet)"
+fi
+echo
+
+echo "Last 14 days with activity:"
+printf "  %-10s %6s %6s %10s\n" "date" "writes" "reads" "hit rate"
+ANY_ROW=0
+i=0
+while [ "$i" -lt 14 ]; do
+  D=$(date -u -v-"${i}"d +%Y-%m-%d 2>/dev/null || date -u -d "-${i} days" +%Y-%m-%d)
+  w=$(awk -F'\t' -v d="$D" '$2=="write" && index($1,d)==1' "$LOG_FILE" | wc -l | tr -d ' ')
+  r=$(awk -F'\t' -v d="$D" '$2=="read" && index($1,d)==1' "$LOG_FILE" | wc -l | tr -d ' ')
+  rh=$(awk -F'\t' -v d="$D" '$2=="read" && index($1,d)==1 && $4+0>0' "$LOG_FILE" | wc -l | tr -d ' ')
+  if [ "$r" -gt 0 ]; then
+    hr=$(awk -v h="$rh" -v t="$r" 'BEGIN{printf "%.0f%%", (h/t)*100}')
+  else
+    hr="-"
+  fi
+  if [ "$w" != "0" ] || [ "$r" != "0" ]; then
+    printf "  %-10s %6s %6s %10s\n" "$D" "$w" "$r" "$hr"
+    ANY_ROW=1
+  fi
+  i=$((i + 1))
+done
+if [ "$ANY_ROW" = "0" ]; then
+  echo "  (nothing in the last 14 days)"
+fi

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Usage: link-check <origin>
+# Checks that a note's origin resolves before the note is approved:
+#   - empty            ok (nothing to follow)
+#   - raw/<file>       the file exists in the vault
+#   - Forgejo/Gitea    the repo is readable with the blacksmith read-only key
+#                      and, for a /src/<ref>/<path> link, the file exists
+#                      at that ref (so an unpushed writeup fails)
+#   - ingested URL     recorded in sources.tsv (the raw copy is the backup;
+#                      the live page is not required to stay up)
+# Exit 0 = resolves. Exit 1 = does not; the reason is printed.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+O="${1:-}"
+[ -z "$O" ] && { echo "ok: empty origin"; exit 0; }
+[ "$O" = "none" ] && { echo "ok: nothing backs this note (origin: none)"; exit 0; }
+
+PROBLEM="$("$ANVIL_PY" "$ANVIL_PKG/libexec/note" --check-origin "$O" 2>&1 || true)"
+if [ "$PROBLEM" != "ok" ]; then
+  echo "fail: $PROBLEM"
+  exit 1
+fi
+
+case "$O" in
+  raw/*) echo "ok: $O exists in the vault"; exit 0 ;;
+esac
+
+REMOTE="$("$ANVIL_PY" "$BS_LIB/hosts.py" ssh-remote "$O" 2>/dev/null || true)"
+if [ -z "$REMOTE" ]; then
+  echo "ok: ingested source recorded in sources.tsv"
+  exit 0
+fi
+
+if ! git ls-remote "$REMOTE" HEAD >/dev/null 2>&1; then
+  echo "fail: cannot read $REMOTE with the read-only key (repo private to the bot user, host down, or off the LAN). Test: ai/blacksmith/lib/hosts.py check"
+  exit 1
+fi
+
+# /<owner>/<repo>/src/(branch|commit|tag)/<ref>/<path>
+# sed -E: BSD sed (macOS) has no \| alternation in basic regex, so the
+# basic form never matched and every file link passed as "repo readable".
+REST="$(printf '%s' "$O" | sed -En 's#^.*/src/(branch|commit|tag)/([^/]*)/(.*)$#\2 \3#p')"
+if [ -z "$REST" ]; then
+  echo "ok: repo readable ($REMOTE)"
+  exit 0
+fi
+REF="${REST%% *}"
+FILE="${REST#* }"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+if git -C "$TMP" init -q && git -C "$TMP" fetch -q --depth 1 --filter=blob:none "$REMOTE" "$REF" 2>/dev/null \
+   && git -C "$TMP" cat-file -e "FETCH_HEAD:$FILE" 2>/dev/null; then
+  echo "ok: $FILE exists at $REF"
+  exit 0
+fi
+echo "fail: $FILE not found at $REF on $REMOTE (not pushed yet?)"
+exit 1

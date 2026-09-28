@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""anvil source — follow a note to what backs it, read-only (the deep layer).
+
+  anvil source <note | link>          show what backs it
+  anvil source --list <note | link>   list the writeups in that repo
+
+What it does with the note's origin (or the link given):
+  Forgejo/Gitea file link   print that file at that ref
+  Forgejo/Gitea repo link   list the repo's .blacksmith/forge/writeups/
+  ingested source URL       point at the clean copy in raw/
+  raw/<file>                point at that file
+
+Repos are read from the current clone when you are inside the same repo;
+otherwise from a shallow, sparse cache clone in
+~/.blacksmith/cache/repos/<owner>/<repo>, fetched with the read-only
+blacksmith-reader key (`ai/blacksmith/install.sh --hosts`). The server
+refuses pushes with that key, and anvil's hook blocks edits in the cache.
+"""
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import anvil_common as ac  # noqa: E402
+
+VAULT = ac.vault()
+CACHE = os.path.join(ac.CACHE_DIR, "repos")
+HOSTS = os.path.join(os.path.dirname(ac.PKG), "lib", "hosts.py")
+WRITEUPS = ".blacksmith/forge/writeups"
+
+
+def run(cmd, cwd=None, check=True):
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=180)
+    if check and res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout).strip()[-400:])
+    return res.stdout
+
+
+def origin_of(target):
+    """A note name or path -> its origin; anything else is taken as a link."""
+    if re.match(r"^https?://", target) or target.startswith("raw/"):
+        return target
+    name = target[:-3] if target.endswith(".md") else target
+    for d in ac.SEARCHED + ("episodic", "_inbox"):
+        p = os.path.join(VAULT, d, os.path.basename(name) + ".md")
+        if os.path.isfile(p):
+            f, _, _ = ac.read_note(p)
+            o = (f.get("origin") or "").strip()
+            if not o:
+                ac.die("%s has no origin; nothing deeper to follow" % os.path.basename(p))
+            return o
+    ac.die("no note or link %r" % target)
+
+
+def parse_link(url):
+    """Return (web_base, owner, repo, ref, path) for a host link, or None."""
+    for web in ac.hosts_web_urls():
+        if url == web or url.startswith(web + "/"):
+            rest = url[len(web):].strip("/").split("/")
+            if len(rest) < 2:
+                return None
+            owner, repo = rest[0], re.sub(r"\.git$", "", rest[1])
+            ref, path = None, None
+            if len(rest) >= 5 and rest[2] in ("src", "raw") and rest[3] in ("branch", "commit", "tag"):
+                ref, path = rest[4], "/".join(rest[5:]) or None
+            return web, owner, repo, ref, path
+    return None
+
+
+def local_clone(web, owner, repo):
+    """The current directory's repo, when it is the same repo."""
+    try:
+        top = run(["git", "rev-parse", "--show-toplevel"]).strip()
+        remote = run(["git", "remote", "get-url", "origin"], cwd=top).strip()
+        mapped = run([sys.executable, HOSTS, "web-url", remote], check=False).strip()
+    except Exception:
+        return None
+    return top if mapped == "%s/%s/%s" % (web, owner, repo) else None
+
+
+def cache_clone(owner, repo, url, want):
+    remote = run([sys.executable, HOSTS, "ssh-remote", url], check=False).strip()
+    if not remote:
+        ac.die("no read-only route to %s; run ai/blacksmith/install.sh --hosts" % url)
+    d = os.path.join(CACHE, owner, repo)
+    try:
+        if not os.path.isdir(os.path.join(d, ".git")):
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            run(["git", "clone", "-q", "--depth", "1", "--filter=blob:none", "--sparse", remote, d])
+        else:
+            run(["git", "fetch", "-q", "--depth", "1", "origin"], cwd=d)
+            run(["git", "reset", "-q", "--hard", "FETCH_HEAD"], cwd=d)
+        current = run(["git", "sparse-checkout", "list"], cwd=d, check=False).split()
+        if want not in current:
+            run(["git", "sparse-checkout", "add", want], cwd=d)
+    except RuntimeError as e:
+        ac.die("cannot read %s with the read-only key: %s\n  Check: python ~/.blacksmith/plugins/lib/hosts.py check" % (remote, e))
+    return d
+
+
+def list_writeups(root, label):
+    base = os.path.join(root, WRITEUPS)
+    if not os.path.isdir(base):
+        print("%s has no writeups (%s/ is empty or missing)." % (label, WRITEUPS))
+        return
+    print("Writeups in %s (%s/):" % (label, WRITEUPS))
+    for dirpath, _, files in sorted(os.walk(base)):
+        for n in sorted(files):
+            if not n.endswith(".md"):
+                continue
+            p = os.path.join(dirpath, n)
+            title = ""
+            with open(p, errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+            print("  %s — %s" % (os.path.relpath(p, root), title))
+    print("Read one with: anvil source <that repo link>/src/branch/main/<path>")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    list_mode = argv[0] == "--list"
+    target = argv[1] if list_mode else argv[0]
+    if list_mode and len(argv) < 2:
+        ac.die("usage: anvil source --list <note | link>")
+    origin = origin_of(target)
+
+    if origin.startswith("raw/"):
+        print("Clean copy in the vault: %s" % os.path.join(VAULT, origin))
+        return 0
+    link = parse_link(origin)
+    if not link:
+        for line in open(os.path.join(VAULT, "sources.tsv")) if os.path.exists(os.path.join(VAULT, "sources.tsv")) else []:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 4 and parts[1] == origin:
+                print("Ingested source %s\nClean copy in the vault: %s" % (origin, os.path.join(VAULT, parts[3])))
+                return 0
+        ac.die("%s is not on a configured host and not an ingested source" % origin)
+
+    web, owner, repo, ref, path = link
+    label = "%s/%s" % (owner, repo)
+    local = local_clone(web, owner, repo)
+    if list_mode or not path:
+        root = local or cache_clone(owner, repo, origin, WRITEUPS)
+        list_writeups(root, label + (" (local clone)" if local else ""))
+        return 0
+
+    if local:
+        full = os.path.join(local, path)
+        if os.path.isfile(full):
+            print("----- %s: %s (local clone) -----" % (label, path))
+            print(open(full, errors="replace").read().rstrip())
+            return 0
+    root = cache_clone(owner, repo, origin, os.path.dirname(path) or ".")
+    # Read the file at exactly the ref the link names (branch, tag, or commit).
+    try:
+        run(["git", "fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", ref], cwd=root)
+    except RuntimeError as e:
+        ac.die("ref %s not found in %s: %s" % (ref, label, e))
+    out = run(["git", "show", "FETCH_HEAD:%s" % path], cwd=root, check=False)
+    if not out:
+        ac.die("%s not found at %s in %s (not pushed yet?)" % (path, ref, label))
+    print("----- %s: %s @ %s (read-only cache) -----" % (label, path, ref))
+    print(out.rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    if not os.path.isdir(VAULT):
+        ac.die("anvil vault not found at %s" % VAULT)
+    sys.exit(main(sys.argv[1:]))

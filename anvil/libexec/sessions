@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# Usage: sessions [--exclude <session-id>] [--pretty]
+#        sessions --record <session-id> <status> <notes-written> [detail]
+# Lists past Claude Code sessions for the current directory
+# AND every subdirectory beneath it, cross-referenced against the local
+# hydrated.tsv state file so each row shows whether /hydrate has already
+# processed it. Listing is read-only; --record appends the progress row
+# that /anvil:hydrate writes after each session.
+#
+# Claude Code keys its session storage by an exact,
+# literal encoding of the cwd a session was launched from (`/` -> `-`) —
+# a session launched from a monorepo's root and one launched from a
+# package inside it land in two unrelated folders, with nothing linking
+# them. Run this from the root you want to sweep (a monorepo root, say)
+# and it finds sessions from every package beneath it in one pass — not
+# an ancestor walk, a descendant scan, matching this script's name
+# ("sessions available from here down").
+#
+# The encoded folder name alone is NOT reliable for matching: "/" and a
+# literal "-" both encode to "-", so a folder literally named "repo-old"
+# is indistinguishable, by name alone, from a child directory "old" under
+# "repo" — this is a real false-positive risk, not just cosmetic (hit and
+# fixed during testing: a sibling repo named "<repo>-other" was wrongly
+# included as if it were a subdirectory "<repo>/other"). Folder-name
+# prefix matching is used only as a cheap first-pass filter to avoid
+# opening every project folder on the machine; each candidate Claude Code
+# session is then confirmed against its own recorded `"cwd":"..."` field
+# (present in every session's .jsonl), which is exact — no decoding or
+# guessing.
+#
+# Default output: one TSV row per session (for a Skill/script to parse):
+#   engine\tsession_id\ttimestamp\tstatus\tgist\tprimary_log_path\tsource_dir
+# status is one of: new, hydrated, partial, failed.
+#   new      — no record in hydrated.tsv yet.
+#   hydrated — fully processed: every candidate got a decision.
+#   partial  — processed, but stopped before every candidate got a decision.
+#   failed   — could not be read/parsed at all.
+# gist is a short human-readable summary. Sorted by source_dir (cwd itself
+# first, since it's always the shortest matching string, then its
+# subdirectories in alphabetical order), newest-first within each.
+#
+# --pretty: human-facing table with ANSI color per status, for running this
+# directly in a real terminal (color won't render inside a chat transcript,
+# which is why the Skill uses emoji instead — see the hydrate SKILL.md).
+#
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+
+# --record <session-id> <status> <notes-written> [detail]: append one row to
+# hydrated.tsv, so /anvil:hydrate records its progress with an `anvil`
+# command (which the Bash(anvil *) permission rule allows) instead of a
+# shell redirect (which prompts the user). The last row per session wins.
+if [ "${1:-}" = "--record" ]; then
+  [ $# -ge 4 ] || { echo "usage: sessions --record <session-id> <hydrated|partial|failed> <notes-written> [detail]" >&2; exit 1; }
+  case "$3" in hydrated|partial|failed) ;; *) echo "status must be hydrated, partial, or failed" >&2; exit 1 ;; esac
+  case "$4" in *[!0-9]*|'') echo "notes-written must be a number" >&2; exit 1 ;; esac
+  mkdir -p "$ANVIL_STATE"
+  DETAIL="$(printf '%s' "${5:-}" | tr '\t\n' '  ')"
+  printf '%s\tclaude\t%s\t%s\t%s\t%s\n' "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$3" "$4" "$DETAIL" \
+    >> "$ANVIL_STATE/hydrated.tsv"
+  echo "recorded $2 as $3 ($4 notes written)"
+  exit 0
+fi
+
+EXCLUDE=""
+PRETTY=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --exclude) EXCLUDE="$2"; shift 2 ;;
+    --pretty) PRETTY=true; shift ;;
+    *) echo "unknown arg: $1" >&2; echo "usage: sessions [--exclude <session-id>] [--pretty] | sessions --record <id> <status> <n> [detail]" >&2; exit 1 ;;
+  esac
+done
+
+# -P (physical/canonical) so this matches however Claude Code itself
+# resolved the cwd it encoded, consistently, regardless of symlinks
+# (e.g. macOS's /tmp -> /private/tmp).
+CWD="$(pwd -P)"
+STATE_DIR="$ANVIL_STATE"
+HYDRATED_FILE="$STATE_DIR/hydrated.tsv"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+touch "$HYDRATED_FILE" 2>/dev/null || true
+
+status_for() {
+  # $1 = session_id. hydrated.tsv rows: session_id\tengine\ttimestamp\tstatus\tnotes_written\tdetail
+  # A session can be recorded more than once (e.g. re-hydrated on purpose);
+  # the LAST matching row wins.
+  local s
+  s=$(awk -F'\t' -v sid="$1" '$1==sid{v=$4} END{if(v!="") print v}' "$HYDRATED_FILE" 2>/dev/null)
+  if [ -n "$s" ]; then
+    echo "$s"
+  else
+    echo "new"
+  fi
+}
+
+ROWS_FILE=$(mktemp)
+SORTED_FILE=$(mktemp)
+trap 'rm -f "$ROWS_FILE" "$SORTED_FILE"' EXIT
+
+CLAUDE_ENC_PREFIX=$(printf '%s' "$CWD" | tr '/' '-')
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+
+if [ -d "$CLAUDE_PROJECTS_DIR" ]; then
+  for PROJECT_DIR in "$CLAUDE_PROJECTS_DIR"/*/; do
+    [ -e "$PROJECT_DIR" ] || continue
+    NAME="$(basename "$PROJECT_DIR")"
+
+    # The encoded folder name alone is NOT enough to tell a real
+    # subdirectory from a sibling whose name happens to contain a literal
+    # "-" at the same spot a "/" would encode to (e.g. "/repo" vs
+    # "/repo-old" both produce "...-repo" as a string prefix) — "/" and
+    # literal "-" both encode to "-", so this is genuinely ambiguous from
+    # the folder name alone. Use it only as a cheap first-pass filter to
+    # avoid opening every project folder on the machine; confirm against
+    # each session's own recorded "cwd" field below, which is exact.
+    if [ "$NAME" != "$CLAUDE_ENC_PREFIX" ] && [ "${NAME#"$CLAUDE_ENC_PREFIX"-}" = "$NAME" ]; then
+      continue
+    fi
+
+    for f in "$PROJECT_DIR"*.jsonl; do
+      [ -e "$f" ] || continue
+      SID="$(basename "$f" .jsonl)"
+      [ "$SID" = "$EXCLUDE" ] && continue
+
+      REAL_CWD=$(grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//')
+      if [ "$REAL_CWD" = "$CWD" ]; then
+        SRC_DIR="$CWD"
+      elif [ "${REAL_CWD#"$CWD"/}" != "$REAL_CWD" ] && [ -n "$REAL_CWD" ]; then
+        SRC_DIR="$REAL_CWD"
+      else
+        # First-pass filter matched the encoded name, but the session's
+        # own recorded cwd proves it's not actually cwd or a descendant
+        # (the sibling-name ambiguity above) — or no cwd field was found
+        # at all. Skip rather than guess.
+        continue
+      fi
+
+      TS=$(grep -m1 '"timestamp"' "$f" | sed -n 's/.*"timestamp":"\([^"]*\)".*/\1/p' | head -1)
+      [ -z "$TS" ] && TS="unknown"
+
+      # Grep finds a handful of candidate lines cheaply; python parses just
+      # those, since user message content can be a plain string OR a list of
+      # {type,text} blocks, and sed can't reliably tell those apart. Skill
+      # invocations (/recall, /note, ...) wrap the real human text in
+      # boilerplate on the first line or two — skip those to find the first
+      # line that reflects actual human intent, within a bounded window so
+      # this stays cheap.
+      OPEN=$(grep '"type":"user"' "$f" | head -40 | "$ANVIL_PY" -c "
+import json, re, sys
+sys.stdout.reconfigure(newline='\n')
+# Blocks the harness adds to a user turn (not the person's words), and
+# a compaction summary, are never the gist.
+HARNESS = re.compile(r'<(system-reminder|local-command-caveat|local-command-stdout|command-name|command-args)>.*?</\1>', re.S)
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        row = json.loads(line)
+        c = (row.get('message') or {}).get('content')
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = ' '.join(b.get('text', '') for b in c if isinstance(b, dict) and b.get('type') == 'text')
+        else:
+            text = ''
+    except Exception:
+        continue
+    text = re.sub(r'</?pasted_content[^>]*>', ' ', HARNESS.sub(' ', text))
+    text = ' '.join(text.split())
+    if not text:
+        continue
+    if text.startswith(('<command-message>', 'Base directory for this skill:',
+                        'This session is being continued from a previous conversation')):
+        continue
+    print(text[:200])
+    break
+" 2>/dev/null || true)
+
+      CLOSE_LINE=$(grep '"type":"last-prompt"' "$f" | tail -1 || true)
+      CLOSE=$(printf '%s' "$CLOSE_LINE" | "$ANVIL_PY" -c "
+import json, sys
+sys.stdout.reconfigure(newline='\n')
+try:
+    row = json.loads(sys.stdin.read())
+    text = row.get('lastPrompt') or ''
+    print(' '.join(text.split())[:200])
+except Exception:
+    print('')
+" 2>/dev/null || true)
+
+      GIST="$OPEN"
+      if [ -n "$CLOSE" ] && [ "$CLOSE" != "$OPEN" ]; then
+        GIST="${OPEN} ... ${CLOSE}"
+      fi
+      GIST="${GIST:0:160}"
+      [ -z "$GIST" ] && GIST="(no readable gist)"
+
+      STATUS=$(status_for "$SID")
+      printf 'claude\t%s\t%s\t%s\t%s\t%s\t%s\n' "$SID" "$TS" "$STATUS" "$GIST" "$f" "$SRC_DIR" >> "$ROWS_FILE"
+    done
+  done
+fi
+
+# Primary: source_dir ascending (cwd itself sorts first, being the
+# shortest matching string; subdirectories follow alphabetically).
+# Secondary: timestamp descending, newest first within each directory.
+sort -t "$(printf '\t')" -k7,7 -k3,3r "$ROWS_FILE" 2>/dev/null > "$SORTED_FILE"
+
+if [ "$PRETTY" = false ]; then
+  cat "$SORTED_FILE"
+  exit 0
+fi
+
+YELLOW='\033[33m'
+GREEN='\033[32m'
+MAGENTA='\033[35m'
+RED='\033[31m'
+RESET='\033[0m'
+
+LAST_DIR=""
+while IFS=$'\t' read -r engine sid ts status gist path source_dir; do
+  if [ "$source_dir" != "$LAST_DIR" ]; then
+    [ -n "$LAST_DIR" ] && echo
+    echo "== $source_dir =="
+    LAST_DIR="$source_dir"
+  fi
+  case "$status" in
+    new) color="$YELLOW" ;;
+    hydrated) color="$GREEN" ;;
+    partial) color="$MAGENTA" ;;
+    failed) color="$RED" ;;
+    *) color="$RESET" ;;
+  esac
+  printf "%b%-9s%b %-8s %-24s %s\n" "$color" "$status" "$RESET" "$engine" "$ts" "$gist"
+done < "$SORTED_FILE"

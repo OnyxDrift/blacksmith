@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""PostToolUse hook: show the user which notes `anvil recall` and
+`anvil show` returned to the model.
+
+A tool result goes to the model, and the terminal folds it away. This hook
+returns a `systemMessage`, which Claude Code shows to the user directly, at
+no model-token cost. It lists the note titles, or the miss.
+
+Silent (exit 0, no output) for any other Bash command.
+"""
+import json
+import re
+import sys
+
+COMMAND = re.compile(r"^\s*anvil\s+(recall|show)\b(.*)$", re.S)
+NUMBERED = re.compile(r"^\d+\.\s+\S+\.md$")
+
+
+def titles(out):
+    """Titles from a recall list (the line after `N. path.md`) or from
+    full notes (the first `# ` heading after each front matter)."""
+    lines = out.splitlines()
+    found = []
+    for i, line in enumerate(lines):
+        if NUMBERED.match(line) and i + 1 < len(lines):
+            found.append(lines[i + 1].strip())
+    if found:
+        return found
+    in_front, seen_front = False, False
+    for line in lines:
+        if line.strip() == "---":
+            in_front = not in_front
+            seen_front = True
+            continue
+        if seen_front and not in_front and line.startswith("# "):
+            found.append(line[2:].strip())
+            seen_front = False
+    return found
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
+    cmd = (data.get("tool_input") or {}).get("command") or ""
+    m = COMMAND.match(cmd)
+    if not m:
+        return
+    verb, args = m.group(1), m.group(2).strip()
+    resp = data.get("tool_response") or {}
+    out = resp.get("stdout", "") if isinstance(resp, dict) else str(resp)
+
+    if verb == "recall" and "No canonical notes match" in out:
+        msg = f"Anvil recall {args}: no match"
+    else:
+        found = titles(out)
+        if not found:
+            return
+        more = re.search(r"^(\d+) more notes match", out, re.M)
+        extra = f" (+{more.group(1)} more)" if more else ""
+        head = f"Anvil {verb} {args}: {len(found)} note(s){extra}"
+        msg = "\n".join([head] + [f"  · {t}" for t in found])
+    print(json.dumps({"systemMessage": msg}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass  # never break a tool call because this display hook is broken

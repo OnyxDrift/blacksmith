@@ -1,0 +1,29 @@
+{
+  "description": "anvil: every vault write goes through the anvil CLI, never Claude's file tools; the user sees which notes recall returned.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run\" guard-vault",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run\" show-recall",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

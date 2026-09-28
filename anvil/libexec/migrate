@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Usage: anvil migrate [--dry-run]
+# Runs any outstanding migrations to bring this vault's NOTE DATA up to
+# the installed SCHEMA_VERSION. This is a different axis from the anvil
+# TOOLING itself (scripts/Skills). Never run automatically — this touches
+# every note file in the vault, so it's a deliberate action.
+#
+# Migrations (migrations/*.sh) are required to be pure, deterministic, and
+# idempotent: they only ever add structure (an empty field, a rename),
+# never guess or fabricate a real value for old data. Filling in a real
+# value for something a migration only added empty is a separate,
+# human-in-the-loop activity — not this script's job.
+#
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+DRY_RUN=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    *) echo "unknown arg: $1" >&2; echo "usage: anvil migrate [--dry-run]" >&2; exit 1 ;;
+  esac
+done
+
+VERSION_FILE="$ANVIL_PKG/SCHEMA_VERSION"
+APPLIED_FILE="$ANVIL_ROOT/.anvil-applied-version"
+MIGRATIONS_DIR="$ANVIL_PKG/migrations"
+
+if [ ! -f "$VERSION_FILE" ]; then
+  echo "error: $VERSION_FILE not found — the anvil package is incomplete" >&2
+  exit 1
+fi
+TARGET=$(tr -d '[:space:]' < "$VERSION_FILE")
+
+if [ -f "$APPLIED_FILE" ]; then
+  CURRENT=$(tr -d '[:space:]' < "$APPLIED_FILE")
+else
+  # No record of what's applied. Migrations are required to be idempotent,
+  # so treating this as "needs everything" is safe, not destructive.
+  CURRENT=""
+fi
+
+build_num() {
+  # Extract the integer after the last underscore, e.g. "0.0.0_12" -> 12.
+  printf '%s' "$1" | sed -n 's/.*_\([0-9][0-9]*\)$/\1/p'
+}
+
+CURRENT_BUILD=0
+[ -n "$CURRENT" ] && CURRENT_BUILD=$(build_num "$CURRENT")
+TARGET_BUILD=$(build_num "$TARGET")
+
+if [ -z "$TARGET_BUILD" ]; then
+  echo "error: could not parse a build number out of SCHEMA_VERSION ('$TARGET')" >&2
+  exit 1
+fi
+
+if [ -n "$CURRENT" ] && [ "$CURRENT_BUILD" -ge "$TARGET_BUILD" ]; then
+  echo "vault schema is already at $CURRENT (installed schema is $TARGET) — nothing to do"
+  exit 0
+fi
+
+if [ ! -d "$MIGRATIONS_DIR" ]; then
+  echo "no migrations/ directory found — nothing to run"
+  exit 0
+fi
+
+# Collect migration files whose build number is > current and <= target,
+# sorted numerically (not lexically — "0.0.0_2" must sort before
+# "0.0.0_10").
+TO_RUN=""
+for m in "$MIGRATIONS_DIR"/*.sh; do
+  [ -e "$m" ] || continue
+  mv_ver="$(basename "$m" .sh)"
+  mv_build=$(build_num "$mv_ver")
+  [ -z "$mv_build" ] && continue
+  if [ "$mv_build" -gt "$CURRENT_BUILD" ] && [ "$mv_build" -le "$TARGET_BUILD" ]; then
+    TO_RUN="$TO_RUN$mv_build:$mv_ver:$m
+"
+  fi
+done
+
+if [ -z "$TO_RUN" ]; then
+  echo "vault schema is at ${CURRENT:-<none>}, installed schema is $TARGET, but no matching migration files were found — nothing to run"
+  exit 0
+fi
+
+SORTED=$(echo "$TO_RUN" | sed '/^$/d' | sort -t: -k1,1n)
+
+if [ "$DRY_RUN" = true ]; then
+  echo "Would run, in order (vault at ${CURRENT:-<none>} -> target $TARGET):"
+  echo "$SORTED" | while IFS=: read -r _ ver _; do
+    echo "  - $ver"
+  done
+  exit 0
+fi
+
+echo "Upgrading vault from ${CURRENT:-<none>} to $TARGET"
+echo "$SORTED" | while IFS=: read -r _ ver path; do
+  echo "Running migration $ver ..."
+  if bash "$path" "$ANVIL_ROOT"; then
+    printf '%s' "$ver" > "$APPLIED_FILE"
+    echo "  applied. vault is now at $ver"
+  else
+    LAST_GOOD=$(tr -d '[:space:]' < "$APPLIED_FILE" 2>/dev/null || echo "<none>")
+    echo "error: migration $ver failed. vault remains at $LAST_GOOD — see $APPLIED_FILE" >&2
+    exit 1
+  fi
+done
+
+# Migrations only ever add fields empty, never guess values — that's what
+# keeps them safe to run unsupervised. If real values are still missing,
+# point at the approval-gated way to fill them in, informational only.
+for FIELD in description origin; do
+  GAPS=$("$ANVIL_PKG/libexec/audit" --field "$FIELD" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$GAPS" -gt 0 ]; then
+    echo
+    echo "$GAPS canonical note(s) have an empty $FIELD. Migrations never guess"
+    echo "real values — run /anvil:backfill $FIELD for approval-gated proposals,"
+    echo "or anvil audit --field $FIELD for the raw list."
+  fi
+done

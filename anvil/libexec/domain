@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Usage: domain add <name> | domain list
+# Adds a domain to domains.txt and creates its moc/<Domain>.md. Domains stay
+# few and broad: add one only after the user agreed to it.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+anvil_require_vault
+
+DOMAINS="$ANVIL_ROOT/domains.txt"
+case "${1:-}" in
+  list)
+    grep -v '^[[:space:]]*#' "$DOMAINS" | sed '/^[[:space:]]*$/d'
+    ;;
+  add)
+    NAME="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -z "$NAME" ] || printf '%s' "$NAME" | grep -q '[^a-z0-9 -]'; then
+      echo "usage: domain add <name>   (lowercase letters, digits, spaces, hyphens)" >&2
+      exit 1
+    fi
+    if grep -v '^[[:space:]]*#' "$DOMAINS" | sed 's/[[:space:]]*$//' | grep -qxF "$NAME"; then
+      echo "domain '$NAME' already exists"
+    else
+      printf '%s\n' "$NAME" >> "$DOMAINS"
+      echo "added domain '$NAME' to domains.txt"
+    fi
+    TITLE="$(printf '%s' "$NAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+    mkdir -p "$ANVIL_ROOT/moc"
+    if [ ! -f "$ANVIL_ROOT/moc/$TITLE.md" ]; then
+      printf '# %s\n' "$TITLE" > "$ANVIL_ROOT/moc/$TITLE.md"
+      echo "created moc/$TITLE.md"
+    fi
+    ;;
+  *)
+    echo "usage: domain add <name> | domain list" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Usage: forge <command> [args...]
+# Mechanical helpers for the forge skills. Claude does the judgement; this
+# does the arithmetic. Works in any git repo; paths are repo-relative.
+#
+#   forge root                   repo root
+#   forge dir                    <root>/.blacksmith/forge (the forge folder)
+#   forge hash <file>            first 12 hex chars of the file's sha256
+#   forge card-path <file>       where that file's context card lives
+#   forge card-check <file>      fresh | stale | missing   (exit 0 | 1 | 2)
+#   forge link <file>            web link to the file on your Forgejo/Gitea
+#                                host (current branch), for anvil notes
+#   forge components             existing writeup component folders
+set -euo pipefail
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+done
+PKG="$(cd "$(dirname "$SELF")/.." && pwd)"
+# The shared blacksmith lib sits next to the plugin: <snapshot>/lib.
+BS_LIB="$(dirname "$PKG")/lib"
+# shellcheck source=../../lib/find-python.sh
+. "$BS_LIB/find-python.sh"
+
+root() {
+  git rev-parse --show-toplevel 2>/dev/null || { echo "error: not inside a git repo" >&2; exit 1; }
+}
+
+relpath() {
+  # relpath <file>: path relative to the repo root (file may not exist yet)
+  local r abs
+  r="$(root)"
+  abs="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)/$(basename "$1")" || { echo "error: no such directory for $1" >&2; exit 1; }
+  r="$(cd "$r" && pwd -P)"
+  case "$abs" in
+    "$r"/*) printf '%s' "${abs#"$r"/}" ;;
+    *) echo "error: $1 is outside the repo" >&2; exit 1 ;;
+  esac
+}
+
+hash12() {
+  shasum -a 256 "$1" | cut -c1-12
+}
+
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift || true
+case "$CMD" in
+  root) root ;;
+  dir) echo "$(root)/.blacksmith/forge" ;;
+  hash)
+    [ -f "${1:-}" ] || { echo "usage: forge hash <file>" >&2; exit 1; }
+    hash12 "$1"
+    ;;
+  card-path)
+    [ -n "${1:-}" ] || { echo "usage: forge card-path <file>" >&2; exit 1; }
+    echo "$(root)/.blacksmith/forge/cards/$(relpath "$1").md"
+    ;;
+  card-check)
+    [ -f "${1:-}" ] || { echo "usage: forge card-check <file>" >&2; exit 1; }
+    CARD="$(root)/.blacksmith/forge/cards/$(relpath "$1").md"
+    if [ ! -f "$CARD" ]; then
+      echo "missing"
+      exit 2
+    fi
+    RECORDED="$(sed -n 's/.*source-sha256:[[:space:]]*\([0-9a-f]\{12\}\).*/\1/p' "$CARD" | head -n 1)"
+    CURRENT="$(hash12 "$1")"
+    if [ "$RECORDED" = "$CURRENT" ]; then
+      echo "fresh: $CARD"
+      exit 0
+    fi
+    echo "stale: card records ${RECORDED:-nothing}, file is now $CURRENT ($CARD)"
+    exit 1
+    ;;
+  link)
+    [ -n "${1:-}" ] || { echo "usage: forge link <file>" >&2; exit 1; }
+    REL="$(relpath "$1")"
+    REMOTE="$(git -C "$(root)" remote get-url origin 2>/dev/null || true)"
+    [ -n "$REMOTE" ] || { echo "error: this repo has no 'origin' remote" >&2; exit 1; }
+    PY="$(bs_python)" || { bs_python_missing; exit 1; }
+    WEB="$("$PY" "$BS_LIB/hosts.py" web-url "$REMOTE" 2>/dev/null || true)"
+    [ -n "$WEB" ] || { echo "error: $REMOTE is not on a configured Forgejo/Gitea host (ai/blacksmith/install.sh --hosts)" >&2; exit 1; }
+    BRANCH="$(git -C "$(root)" rev-parse --abbrev-ref HEAD)"
+    echo "$WEB/src/branch/$BRANCH/$REL"
+    ;;
+  components)
+    D="$(root)/.blacksmith/forge/writeups"
+    [ -d "$D" ] && find "$D" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort || true
+    ;;
+  help|-h|--help)
+    sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//'
+    ;;
+  *) echo "unknown command: $CMD (see: forge help)" >&2; exit 1 ;;
+esac

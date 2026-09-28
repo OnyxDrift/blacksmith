@@ -1,0 +1,22 @@
+{
+  "name": "blacksmith",
+  "description": "An opinionated suite of Claude Code plugins for fast, accurate agentic development.",
+  "owner": {
+    "name": "DJ Smith"
+  },
+  "plugins": [
+    {
+      "name": "anvil",
+      "source": "./anvil",
+      "description": "Long-term memory: a markdown vault of atomic notes, searched on demand, written only with approval."
+    },
+    {
+      "name": "forge",
+      "source": "./forge",
+      "description": "Working conventions for any repo: writeups, todo tracking, context cards, and credential setup."
+    }
+  ],
+  "metadata": {
+    "version": "0.0.3"
+  }
+}
