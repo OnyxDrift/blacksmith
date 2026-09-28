@@ -1,7 +1,7 @@
 {
   "name": "forge",
   "displayName": "Forge",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Working conventions for any repo: writeups of hard-won lessons, todo tracking, context cards for large files, and safe credential setup.",
   "author": {
     "name": "DJ Smith"

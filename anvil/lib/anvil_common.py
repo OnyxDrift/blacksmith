@@ -14,6 +14,14 @@ import sys
 sys.stdout.reconfigure(newline="\n")
 
 PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def hosts_py():
+    """The shared hosts.py: the plugin's own lib/ copy (made by the
+    installer, because Claude Code runs a cache copy of the plugin folder
+    alone), else ../lib in a source checkout."""
+    own = os.path.join(PKG, "lib", "hosts.py")
+    return own if os.path.isfile(own) else os.path.join(os.path.dirname(PKG), "lib", "hosts.py")
 HOME = os.path.expanduser("~")
 BLACKSMITH_HOME = os.environ.get("BLACKSMITH_HOME") or os.path.join(HOME, ".blacksmith")
 CONFIG_DIR = os.path.join(BLACKSMITH_HOME, "config")
@@ -193,8 +201,7 @@ def detect_origin():
         return ""
     if not remote:
         return ""
-    # The shared blacksmith lib sits next to the plugin: <snapshot>/lib.
-    hosts = os.path.join(os.path.dirname(PKG), "lib", "hosts.py")
+    hosts = hosts_py()
     try:
         res = subprocess.run([sys.executable, hosts, "web-url", remote], capture_output=True,
                              text=True, timeout=15)

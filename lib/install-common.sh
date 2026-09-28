@@ -8,7 +8,13 @@
 # Installed layout, all under $BLACKSMITH_HOME/plugins (the snapshot):
 #   <plugin>/                     a copy of the plugin (what Claude Code runs)
 #   <plugin>/.installed-from      source folder, commit, and sync time
-#   lib/                          a copy of the shared lib (hosts.py, ...)
+#   <plugin>/lib/find-python.sh, <plugin>/lib/hosts.py
+#                                 the shared runtime files, copied into each
+#                                 plugin: Claude Code runs a plugin from its
+#                                 own cache copy (~/.claude/plugins/cache/
+#                                 blacksmith/<plugin>/<version>), which holds
+#                                 only the plugin folder
+#   lib/                          a copy of the shared lib, for the installers
 #   .claude-plugin/marketplace.json  the `blacksmith` marketplace, listing
 #                                 only the plugins present in the snapshot
 # Plugin ids stay <plugin>@blacksmith with one plugin installed or both.
@@ -78,6 +84,8 @@ bs_snapshot_plugin() {
   "$PY" "$BS_SRC/lib/snapshot.py" "$BS_SRC/$PLUGIN" "$SNAP/$PLUGIN" \
     --exclude-top install.sh --exclude-top uninstall.sh
   "$PY" "$BS_SRC/lib/snapshot.py" "$BS_SRC/lib" "$SNAP/lib"
+  mkdir -p "$SNAP/$PLUGIN/lib"
+  cp "$BS_SRC/lib/find-python.sh" "$BS_SRC/lib/hosts.py" "$SNAP/$PLUGIN/lib/"
   rev="$(bs_rev "$BS_SRC")"
   printf 'source\t%s\ncommit\t%s\nsynced\t%s\n' "$BS_SRC/$PLUGIN" "$rev" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SNAP/$PLUGIN/.installed-from"
@@ -105,11 +113,66 @@ bs_register() {
   id="$PLUGIN@$MARKETPLACE"
   if claude plugin list --json 2>/dev/null | "$PY" "$SETTINGS_PY" has-plugin "$id"; then
     claude plugin update "$id" >/dev/null 2>&1 || true
-    echo "  $id up to date (loads from $SNAP/$PLUGIN)"
+    # Claude Code copies a plugin into its cache once per version. A
+    # snapshot from another commit with the same version needs a reinstall,
+    # or sessions keep running the old copy.
+    if [ "$(bs_cached_commit "$id")" != "$(bs_commit_of "$SNAP/$PLUGIN/.installed-from")" ]; then
+      claude plugin uninstall "$id" >/dev/null 2>&1 || true
+      bs_claude_install "$id"
+      echo "  reinstalled $id: the cached copy was from another commit"
+    else
+      echo "  $id up to date"
+    fi
   else
-    claude plugin install "$id" >/dev/null
-    echo "  installed $id (loads from $SNAP/$PLUGIN)"
+    bs_claude_install "$id"
+    echo "  installed $id"
   fi
+  echo "    Claude Code runs it from $(bs_install_path "$id")"
+}
+
+bs_install_path() {
+  claude plugin list --json 2>/dev/null | "$PY" "$SETTINGS_PY" install-path "$1" || true
+}
+
+# The commit line of an .installed-from file (empty when there is none).
+bs_commit_of() {
+  [ -f "$1" ] || return 0
+  awk -F'\t' '$1 == "commit" { sub(/\r$/, "", $2); print $2 }' "$1"
+}
+
+bs_cached_commit() {
+  local path
+  path="$(bs_install_path "$1")"
+  [ -n "$path" ] || return 0
+  bs_commit_of "$(bs_norm "$path")/.installed-from"
+}
+
+# `claude plugin install`, retried: on Windows it fails at random with
+# EPERM when antivirus holds a file of the fresh copy open (Claude Code
+# issues #81774, #54053).
+bs_claude_install() {
+  local try out
+  for try in 1 2 3; do
+    if out="$(claude plugin install "$1" 2>&1)"; then
+      return 0
+    fi
+    if [ "$try" -lt 3 ]; then
+      echo "  install of $1 failed (try $try of 3); retrying in 5 seconds"
+      sleep 5
+    fi
+  done
+  printf '%s\n' "$out" | sed 's/^/    /' >&2
+  cat >&2 <<EOF
+error: could not install $1.
+  On Windows, "EPERM ... rename" is a known Claude Code issue: something
+  holds the new files open. Then:
+    1. Close every Claude Code window and session, and run the installer again.
+    2. Delete leftover folders: ~/.claude/plugins/cache/temp_local_* and
+       ~/.claude/plugins/cache/$MARKETPLACE/$PLUGIN
+    3. If it still fails, ask IT to exclude ~/.claude/plugins from antivirus
+       scanning.
+EOF
+  exit 1
 }
 
 # Uninstall the plugin, remove its snapshot folder, and remove the

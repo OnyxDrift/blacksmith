@@ -672,7 +672,7 @@ def cmd_review(path, of, part=""):
 def main():
     opts = parse(sys.argv[1:])
     if not os.path.isdir(VAULT):
-        ac.die("anvil vault not found at %s (set ANVIL_HOME or run ai/blacksmith/install.sh)" % VAULT)
+        ac.die("anvil vault not found at %s (set ANVIL_HOME or run blacksmith/install.sh)" % VAULT)
     if opts.get("drafts"):
         return cmd_drafts()
     if opts.get("list_drafts"):

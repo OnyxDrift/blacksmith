@@ -315,7 +315,7 @@ if [ "$MODE" = "multi" ]; then
        config/ are machine-local.
     3. Actions > Show ID: copy this machine's device ID.
     4. On each other machine: install Syncthing, add this device, accept the
-       'anvil' folder share, then run ai/blacksmith/install.sh there and
+       'anvil' folder share, then run blacksmith/install.sh there and
        choose 'existing vault'.
     5. Trusting a device shares nothing by itself: edit the folder ->
        Sharing -> tick the new device.

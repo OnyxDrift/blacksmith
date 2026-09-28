@@ -13,7 +13,7 @@ What it does with the note's origin (or the link given):
 Repos are read from the current clone when you are inside the same repo;
 otherwise from a shallow, sparse cache clone in
 ~/.blacksmith/cache/repos/<owner>/<repo>, fetched with the read-only
-blacksmith-reader key (`ai/blacksmith/install.sh --hosts`). The server
+blacksmith-reader key (`blacksmith/install.sh --hosts`). The server
 refuses pushes with that key, and anvil's hook blocks edits in the cache.
 """
 import os
@@ -26,7 +26,7 @@ import anvil_common as ac  # noqa: E402
 
 VAULT = ac.vault()
 CACHE = os.path.join(ac.CACHE_DIR, "repos")
-HOSTS = os.path.join(os.path.dirname(ac.PKG), "lib", "hosts.py")
+HOSTS = ac.hosts_py()
 WRITEUPS = ".blacksmith/forge/writeups"
 
 
@@ -82,7 +82,7 @@ def local_clone(web, owner, repo):
 def cache_clone(owner, repo, url, want):
     remote = run([sys.executable, HOSTS, "ssh-remote", url], check=False).strip()
     if not remote:
-        ac.die("no read-only route to %s; run ai/blacksmith/install.sh --hosts" % url)
+        ac.die("no read-only route to %s; run blacksmith/install.sh --hosts" % url)
     d = os.path.join(CACHE, owner, repo)
     try:
         if not os.path.isdir(os.path.join(d, ".git")):

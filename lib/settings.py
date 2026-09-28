@@ -23,6 +23,9 @@ Subcommands:
         path of the marketplace with that name (nothing if absent).
   has-plugin <id>
         Read `claude plugin list --json` on stdin; exit 0 if <id> is in it.
+  install-path <id>
+        Read `claude plugin list --json` on stdin and print the folder that
+        Claude Code runs the plugin from (its cache copy).
   marketplace-write <source marketplace.json> <snapshot dir>
         Write <snapshot dir>/.claude-plugin/marketplace.json: the source
         file, with only the plugins whose folder is in the snapshot. Print
@@ -207,6 +210,14 @@ def main(argv):
             die("usage: settings.py has-plugin <id>")
         found = any(isinstance(p, dict) and p.get("id") == rest[0] for p in read_stdin_json())
         return 0 if found else 1
+    if cmd == "install-path":
+        if len(rest) != 1:
+            die("usage: settings.py install-path <id>")
+        for p in read_stdin_json():
+            if isinstance(p, dict) and p.get("id") == rest[0]:
+                print(p.get("installPath", ""))
+                break
+        return 0
     if cmd == "marketplace-write":
         if len(rest) != 2:
             die("usage: settings.py marketplace-write <source marketplace.json> <snapshot dir>")

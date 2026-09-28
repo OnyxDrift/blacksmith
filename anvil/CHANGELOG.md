@@ -41,6 +41,16 @@ Baseline note schema: `type`, `domain`, `subdomain`, `project`, `source`,
 
 ## Tooling (the anvil scripts and Skills themselves; `version` in `.claude-plugin/plugin.json` since 0.0.0_8, `TOOLING_VERSION` before)
 
+### 0.0.4
+
+Claude Code runs a plugin from its own cache copy
+(`~/.claude/plugins/cache/blacksmith/<plugin>/<version>`), which holds only
+the plugin folder. The installer now copies the shared runtime files
+(`find-python.sh`, `hosts.py`) into the plugin's `lib/`, and reinstalls
+when the cached copy is from another commit. `claude plugin install` is
+retried three times for the Windows EPERM rename bug (Claude Code issues
+#81774, #54053), then names the fixes.
+
 ### 0.0.3
 
 Anvil installs alone. `anvil/install.sh` copies the plugin into the

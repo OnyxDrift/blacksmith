@@ -34,7 +34,7 @@ if [ -z "$REMOTE" ]; then
 fi
 
 if ! git ls-remote "$REMOTE" HEAD >/dev/null 2>&1; then
-  echo "fail: cannot read $REMOTE with the read-only key (repo private to the bot user, host down, or off the LAN). Test: ai/blacksmith/lib/hosts.py check"
+  echo "fail: cannot read $REMOTE with the read-only key (repo private to the bot user, host down, or off the LAN). Test: blacksmith/lib/hosts.py check"
   exit 1
 fi
 

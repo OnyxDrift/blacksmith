@@ -10,7 +10,11 @@
 set -euo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../../lib/find-python.sh
-. "$(dirname "$(dirname "$SELF_DIR")")/lib/find-python.sh"
+if [ -f "$SELF_DIR/../lib/find-python.sh" ]; then
+  . "$SELF_DIR/../lib/find-python.sh"
+else
+  . "$(dirname "$(dirname "$SELF_DIR")")/lib/find-python.sh"
+fi
 ANVIL_PY="$(bs_python || true)"
 
 LOG=""

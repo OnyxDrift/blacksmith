@@ -11,8 +11,8 @@ files, and a human gate on anything that becomes long-term knowledge.
 Blacksmith is a Claude Code **plugin marketplace** with two plugins,
 anvil and forge. Install both, or only one.
 
-> **Version 0.0.3**: anvil 0.0.3 and forge 0.0.2. The first public
-> release. Version 0.0.1 was checked by hand command by command on
+> **Version 0.0.4**: anvil 0.0.4 and forge 0.0.3. 0.0.3 was the first
+> public release. Version 0.0.1 was checked by hand command by command on
 > 2026-09-24. Builds between releases add `_N` (for example `0.0.2_1`).
 
 ## Plugins

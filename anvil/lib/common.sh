@@ -18,8 +18,14 @@
 
 ANVIL_PKG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLACKSMITH_HOME="${BLACKSMITH_HOME:-$HOME/.blacksmith}"
-# The shared blacksmith lib sits next to the plugin: <snapshot>/lib.
-BS_LIB="$(dirname "$ANVIL_PKG")/lib"
+# The shared runtime files (find-python.sh, hosts.py): the installer copies
+# them into the plugin's own lib/, because Claude Code runs a cache copy of
+# the plugin folder alone. In a source checkout they sit in ../lib.
+if [ -f "$ANVIL_PKG/lib/find-python.sh" ]; then
+  BS_LIB="$ANVIL_PKG/lib"
+else
+  BS_LIB="$(dirname "$ANVIL_PKG")/lib"
+fi
 # shellcheck source=../../lib/find-python.sh
 . "$BS_LIB/find-python.sh"
 # The Python 3.8+ that the installer found (empty when there is none; the
@@ -61,7 +67,7 @@ anvil_tooling_version() {
 anvil_require_vault() {
   if [ ! -d "$ANVIL_ROOT" ]; then
     echo "error: anvil vault not found at $ANVIL_ROOT" >&2
-    echo "  Set ANVIL_HOME, or run ai/blacksmith/install.sh to create or point at one." >&2
+    echo "  Set ANVIL_HOME, or run blacksmith/install.sh to create or point at one." >&2
     exit 1
   fi
 }

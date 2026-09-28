@@ -9,7 +9,7 @@ atomic notes. Claude searches it when it needs to and adds to it only with
 your approval. A lesson learned in one session is available in the next, in
 any project. Anvil is part of [blacksmith](../README.md).
 
-> **Version 0.0.3** (tooling), schema 0.0.0_3. The first public release,
+> **Version 0.0.4** (tooling), schema 0.0.0_3. The first public release,
 > in [blacksmith](https://github.com/OnyxDrift/blacksmith). Every command
 > below was first checked by hand on 2026-09-24.
 > [CHANGELOG.md](CHANGELOG.md) has the history.

@@ -18,8 +18,14 @@ while [ -L "$SELF" ]; do
   case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
 done
 PKG="$(cd "$(dirname "$SELF")/.." && pwd)"
-# The shared blacksmith lib sits next to the plugin: <snapshot>/lib.
-BS_LIB="$(dirname "$PKG")/lib"
+# The shared runtime files (find-python.sh, hosts.py): the installer copies
+# them into the plugin's own lib/, because Claude Code runs a cache copy of
+# the plugin folder alone. In a source checkout they sit in ../lib.
+if [ -f "$PKG/lib/find-python.sh" ]; then
+  BS_LIB="$PKG/lib"
+else
+  BS_LIB="$(dirname "$PKG")/lib"
+fi
 # shellcheck source=../../lib/find-python.sh
 . "$BS_LIB/find-python.sh"
 
@@ -79,7 +85,7 @@ case "$CMD" in
     [ -n "$REMOTE" ] || { echo "error: this repo has no 'origin' remote" >&2; exit 1; }
     PY="$(bs_python)" || { bs_python_missing; exit 1; }
     WEB="$("$PY" "$BS_LIB/hosts.py" web-url "$REMOTE" 2>/dev/null || true)"
-    [ -n "$WEB" ] || { echo "error: $REMOTE is not on a configured Forgejo/Gitea host (ai/blacksmith/install.sh --hosts)" >&2; exit 1; }
+    [ -n "$WEB" ] || { echo "error: $REMOTE is not on a configured Forgejo/Gitea host (blacksmith/install.sh --hosts)" >&2; exit 1; }
     BRANCH="$(git -C "$(root)" rev-parse --abbrev-ref HEAD)"
     echo "$WEB/src/branch/$BRANCH/$REL"
     ;;

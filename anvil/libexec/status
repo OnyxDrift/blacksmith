@@ -17,7 +17,7 @@ echo
 # the package ships SCHEMA_VERSION, the vault records what its data is
 # migrated to in .anvil-applied-version, `anvil migrate` closes the gap.
 # Tooling = the anvil package itself (plugin.json version), updated with
-# `git pull` + `ai/blacksmith/install.sh --update`. ---
+# `git pull` + `blacksmith/install.sh --update`. ---
 INSTALLED_SCHEMA=$(tr -d '[:space:]' < "$ANVIL_PKG/SCHEMA_VERSION" 2>/dev/null || true)
 if [ -n "$INSTALLED_SCHEMA" ]; then
   if [ -f "$ANVIL_ROOT/.anvil-applied-version" ]; then

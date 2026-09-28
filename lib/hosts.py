@@ -71,7 +71,7 @@ def load_hosts():
 def save_hosts(rows):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(HOSTS_FILE, "w") as f:
-        f.write("# blacksmith hosts — written by ai/blacksmith/lib/hosts.py setup\n")
+        f.write("# blacksmith hosts — written by blacksmith/lib/hosts.py setup\n")
         f.write("#" + "\t".join(COLUMNS) + "\n")
         for r in rows:
             f.write("\t".join(r[c] for c in COLUMNS) + "\n")
@@ -272,9 +272,9 @@ def cmd_setup(args):
             ok, msg = check(row)
             print("  %s: %s" % ("PASS" if ok else "FAIL", msg))
             if not ok:
-                print("  Re-test later with: ai/blacksmith/lib/hosts.py check")
+                print("  Re-test later with: blacksmith/lib/hosts.py check")
     else:
-        print("Test later with: ai/blacksmith/lib/hosts.py check")
+        print("Test later with: blacksmith/lib/hosts.py check")
     return 0
 
 
